@@ -229,6 +229,30 @@ own CNR/SNR curve is explicitly still uncalibrated at the low end for
 exactly that reason (every real sample gathered so far locked solidly at
 47%+; there's no data near where a channel actually fails).
 
+**Different tuner chipsets don't share a raw dB scale — the floor/ceiling
+constants above are chip-specific, not physical constants.** Tested
+2026-07-25 with a Hauppauge WinTV HVR-950Q (`au0828`/`AU8522`) swapped in
+alongside the 955Q (`si2157`/`lgdt3306a`) this project's constants were
+calibrated against: the 950Q's raw CNR reading hard-caps around 27 dB
+(confirmed — pinned at exactly 27.000 across six different channels with
+otherwise-different signal strengths) versus the 955Q reaching ~32.77 dB
+on its strongest channel, close to this project's 33.0 dB ceiling. Since
+that ceiling is a single global constant, the 950Q's `snq=` permanently
+caps around 79% no matter how strong the actual signal is — a real,
+confirmed limitation, left as-is (no per-chip HDHomeRun reference exists
+to calibrate a proper 950Q ceiling against; a per-adapter config override
+would be the fix if this is ever revisited).
+On the low/floor end, informal (not lab-verified) side-by-side viewing
+experience suggests the two chips' failure points sit at different raw
+dB values too: the 950Q visibly starts pixelating below roughly 15 dB
+raw CNR, while the 955Q holds up until somewhere around 17.5 dB on most
+channels before doing the same. Consistent with the point above — these
+are each driver's own internal reporting convention, not a standardized
+physical unit (unlike `signal_strength`, which the kernel API does
+define in real dBm) — so "15" and "17.5" aren't directly comparable
+across chips in an absolute sense, just each chip's own empirical
+cliff.
+
 ## Build
 
 Needs a C11 compiler and the Linux DVB kernel headers (`linux/dvb/*.h`)
