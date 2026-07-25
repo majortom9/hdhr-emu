@@ -418,3 +418,7 @@ Still worth doing:
 4. CNR/SNR calibration has no data near the real lock-loss floor yet —
    every real-signal sample gathered so far locked solidly (47%+); see
    "Calibrating signal stats" below.
+
+## License
+
+GPLv3 — see [LICENSE](LICENSE).
