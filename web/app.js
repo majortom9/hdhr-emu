@@ -8,7 +8,14 @@ function escapeHtml(s) {
 async function loadDeviceInfo() {
   try {
     const d = await (await fetch('/discover.json')).json();
-    document.getElementById('device-name').textContent = d.FriendlyName;
+    /* FriendlyName ("HDHomeRun CONNECT" etc.) is deliberately the same
+     * text a real device would use -- that's what Plex/Emby/hdhomerun_config
+     * expect for protocol compatibility, and changing it there would
+     * affect those, not just this page. Prefixing it here only, in the
+     * web UI's own display, keeps that compatibility while still making
+     * it obvious to anyone looking at *this dashboard* that it's the
+     * emulator, not real SiliconDust hardware. */
+    document.getElementById('device-name').textContent = `hdhr-emu — ${d.FriendlyName}`;
     document.getElementById('device-sub').textContent =
       `${d.ModelNumber} · Device ID ${d.DeviceID} · ${d.TunerCount} tuner(s)`;
   } catch (e) { /* transient -- next poll cycle isn't scheduled for this, just leave the default title */ }

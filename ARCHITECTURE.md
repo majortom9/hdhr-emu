@@ -805,3 +805,84 @@ held.
   requests — and check `ps aux`/`ss -tnp` for other local processes before
   trusting a capture's contents as caused by whatever you just did in a
   client UI.
+
+## 18. Web UI — a GETSET client of itself, not a fork of control.c
+
+`control.c` owns all tuner state/locking, and §4/§17 above are a small
+sample of how much iteration went into getting its channel-SET path
+right (FIFO queueing for a busy tuner, non-blocking claim, the
+`lgdt3306a` D-state workaround). When the web UI (`web_ui.c`) needed to
+tune/release/read status, the temptation was to call into that same
+code in-process from the HTTP thread. Rejected: any such refactor risks
+reintroducing exactly the class of bug §4/§17 document fixing, in code
+that's already correct and well-tested.
+
+Instead, `getset_client.c` is a **minimal loopback GETSET client** —
+it opens its own short-lived TCP connection to `127.0.0.1:65001` (the
+same port `control.c` already listens on) and speaks the identical
+wire protocol `hdhomerun_config` does, reusing `hdhr_pkt.c`'s existing
+TLV/CRC32 encode/decode primitives to build the request and parse the
+reply. From `control.c`'s perspective, the web UI is just another
+GETSET client — indistinguishable from a real one, and subject to the
+exact same (already-hardened) tuning/queueing/locking logic. Zero lines
+of `control.c` changed to support the web UI.
+
+**A race this design didn't anticipate, found via live testing**: a
+channel SET already blocks until the tune/lock result is known
+(§4's `CHANNEL_SET_WAIT_MS`), but a status GET fired immediately
+afterward can still land before `held_stats_thread_main()`
+(`tuner.c`, `HELD_STATS_REFRESH_MS=500`) publishes its first real
+reading — landing on `handle_tuner_get()`'s documented "hold was only
+just opened" placeholder (`ch=%s lock=none ss=45 snq=0 seq=0`)
+instead. `web_ui.c`'s `handle_channel_post()` retries the follow-up
+status GET up to 3 times (300ms apart) if it matches that exact
+placeholder signature, rather than surface it as if it were a real
+reading — bounded so a tuner that genuinely never locks doesn't hang
+here.
+
+**A request-parsing bug this design surfaced, also found via live
+testing**: `http_server.c`'s original `handle_request()` did a single
+fixed-size `read()` of the whole request into a 2048-byte buffer. A
+stray ~3KB `Cookie` header — leftover from an unrelated past service
+that once ran on the same hostname, still attached to every request a
+browser sent — pushed a POST's actual body past what that one `read()`
+ever captured. The body-extraction code then silently grabbed leftover
+*header* bytes instead of the real value, and `control.c` correctly
+rejected the resulting garbage with a channel-format error — a genuine
+bug, not a fluke of that one browser's cookie jar, since *any*
+sufficiently large (or slow-to-arrive) header block could trigger the
+same failure. Fixed by having `handle_request()` loop, reading further
+as needed, until the full header block (`"\r\n\r\n"`) is actually in
+hand before parsing the request line or extracting a body — bounded at
+8KB total, returning `431 Request Header Fields Too Large` past that,
+so a client that never terminates its headers can't hold a connection
+thread open forever.
+
+**Player deep-link quirks** (`web/app.js`'s `vlcLinkOrNull()`/
+`mpvLinkOrNull()`), confirmed live across iOS, Android, and desktop —
+worth knowing before "fixing" one of these again:
+- A raw `/auto/vX.X` stream link doesn't work from a plain browser tab
+  at all: no `Content-Length` (a live stream never ends), so it just
+  shows as an endless download with no way to stop it. The `.m3u`
+  download (`http_server.c`'s `handle_m3u()`) and a clipboard-copy
+  button are the two mechanisms that don't depend on a browser knowing
+  what to do with unbounded `video/mpeg` content.
+- iOS Safari reliably hands off a bare `vlc://<url>` to VLC. Android's
+  VLC doesn't register that scheme the same way — Chrome for Android
+  needs the `intent://` URI format instead, targeting VLC's package
+  name (`org.videolan.vlc`) directly, the standard way a web page
+  deep-links into a specific installed Android app.
+- That Android intent needs an explicit `type=video/mpeg` (matching
+  what `stream_channel_to_client()` actually declares) or it opens the
+  target app to its general browse screen instead of playing —
+  without a MIME type hint, Android has nothing to route the
+  `ACTION_VIEW` to a specific playback handler with. The same
+  `intent://` + `type=` combination, targeting mpv-android's package
+  (`is.xyz.mpv`), works identically for mpv on Android.
+- Desktop `vlc://`/`mpv://` were tried and confirmed dead on a real
+  PC: neither app had registered itself as a URL protocol handler with
+  the OS. There's no code fix available here — a browser deliberately
+  has no way to launch a local program directly (allowing that would
+  let any website run arbitrary code on a visitor's machine) — so
+  `copy`/`m3u` are the only options offered on desktop, and
+  `vlc`/`mpv` are hidden there rather than shown as dead links.

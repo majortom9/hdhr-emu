@@ -292,6 +292,42 @@ immediately, but `lineup.json` will be empty or partial until the scan
 finishes. Watch the log for `dvb_scan: complete — N virtual channel(s)
 found`.
 
+## Web UI
+
+A phone/browser-friendly status-and-control dashboard is served
+automatically once the daemon is running — no separate setup, just
+open `http://<host>/` (the same host/port real HDHomeRun clients pull
+`lineup.json`/streams from). It's a plain static page (`web/`, no
+build step, no framework) talking to a small JSON API
+(`src/web_ui.c`) that never touches tuner state directly — see
+[ARCHITECTURE.md §18](ARCHITECTURE.md) for why.
+
+Per tuner, it shows live status (locked channel, signal-strength/
+quality/symbol-quality bars, network rate, virtual channels found on
+the current mux), and lets you:
+- **Set** a channel manually (channel number, e.g. `24`)
+- **Release** a tuner back to `none` so it's not left parked/held when
+  you're done with it
+- **Scan** the full US RF band (2-36), mirroring `hdhomerun_config`'s
+  own scan approach
+
+The lineup view lists every known virtual channel with a few ways to
+actually play one — a raw `/auto/vX.X` MPEG-TS link doesn't work from
+a plain browser tab (no `Content-Length`, since a live stream never
+ends, so it just shows as an endless download with no way to stop it):
+- **copy** — puts the raw stream URL on the clipboard, for pasting
+  into any player's "open network stream"
+- **m3u** — downloads a tiny playlist wrapping the stream URL
+  (`/auto/vX.X.m3u`); works well on desktop, where the OS hands the
+  download to whatever's registered for `.m3u`
+- **vlc** — one-tap deep link into VLC. Works on both Android and iOS;
+  hidden on desktop (VLC's desktop installers don't reliably register
+  as a URL protocol handler, and a browser can't launch a local
+  program directly — no code fix possible there, `m3u`/`copy` are the
+  reliable desktop path)
+- **mpv** — same idea, Android only (no comparably standardized mpv
+  port/protocol-handler on iOS or desktop)
+
 ## Generating a stable device ID
 
 ```sh
@@ -315,6 +351,12 @@ src/
                      header comment for the full endpoint list)
   http_server.*     discover.json / lineup.json / lineup_status.json /
                      auto/vX.X (TCP 80)
+  getset_client.*    loopback GETSET client -- talks to this daemon's
+                      own control port exactly like hdhomerun_config
+                      does, in-process; see web_ui.c below
+  web_ui.*            the web UI's JSON API (/api/tuners.json,
+                      POST /api/tuner<N>/channel) + static file
+                      serving from web_root -- see ARCHITECTURE.md §18
   udp_stream.*      raw UDP unicast TS push (the "target=" mechanism)
   keepalive.*        UDP 5004 — reclaims a target= push abandoned by an
                       uncleanly-terminated client (crash, kill -9,
@@ -343,6 +385,8 @@ tools/
                          signal stats against real hardware" below
 config/                example config
 systemd/                service unit
+web/                    the web UI's static files (index.html/style.css/
+                         app.js, no build step) -- see "Web UI" above
 ARCHITECTURE.md         deeper technical detail — the "why" behind the
                          non-obvious parts of the design (see especially
                          if you're touching control.c's channel-SET
@@ -385,10 +429,15 @@ ARCHITECTURE.md         deeper technical detail — the "why" behind the
   client on the LAN stop the daemon. When enabled it's a full process
   exit, no in-place re-exec; needs a supervisor (systemd's
   `Restart=always`) to come back up on its own.
-- **No incremental rescan** — `scan_on_startup=0` currently means an
-  empty lineup until next restart; there's no runtime "trigger a
-  rescan" control yet (`dvb_scan_run()` exists and could be wired to
-  one easily — see main.c's `scan_thread_main`).
+- **No incremental rescan at the protocol level** — `scan_on_startup=0`
+  still means an empty lineup until next restart via the raw control
+  protocol; `dvb_scan_run()` (main.c's `scan_thread_main`) isn't wired
+  to any GETSET endpoint. The web UI's Scan button covers the practical
+  need a different way — a client-side loop of sequential
+  `/tunerN/channel` SETs across the RF band, same approach
+  `hdhomerun_config`'s own scan command uses — so this only matters if
+  you're driving the raw protocol directly (e.g. `hdhomerun_config`)
+  without the web UI.
 - **QAM/cable support (`us-cable`/`us-hrc`/`us-irc`/`kr-bcast`/`kr-cable`)
   is UNTESTED against real signal** — implemented (frequency tables,
   QAM tuning, CVCT parsing, a no-CVCT raw-program-number fallback) but
@@ -434,9 +483,9 @@ forever.
 Still worth doing:
 1. A stream pull through a real DVR client (Plex, Channels DVR,
    Jellyfin) end to end, not just `hdhomerun_config`/`hdhomerun_config_gui`.
-2. Wire up a runtime "trigger a rescan" control — `dvb_scan_run()`
-   already exists and does the right thing, it's just not reachable from
-   the control protocol yet (see "Known simplifications").
+2. Wire `dvb_scan_run()` to an actual GETSET endpoint so the raw
+   control protocol has its own runtime rescan trigger, not just the
+   web UI's client-side scan loop (see "Known simplifications").
 3. Second-tuner (`tuner1`+) validation under real concurrent load — most
    testing so far has exercised one physical adapter at a time.
 4. CNR/SNR calibration has no data near the real lock-loss floor yet —
