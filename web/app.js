@@ -163,41 +163,48 @@ function copyToClipboard(text) {
   document.body.removeChild(ta);
 }
 
-/* iOS Safari reliably hands off a bare "vlc://" URL to VLC, but VLC
- * for Android doesn't register that scheme the same way -- confirmed
- * live (VLC installed on both, vlc:// worked on iPhone, silently did
- * nothing on Android). Chrome for Android instead has first-class
- * support for "intent://" URIs targeting a specific app's package
- * name directly, which is the standard way web pages deep-link into
- * an installed Android app. Desktop VLC also registers vlc://, so
- * that's the fallback for anything that isn't detected as Android.
- * Confirmed live: without an explicit type=, the intent opened VLC
- * but landed on its general browse screen instead of playing --
- * adding the MIME type this server's own stream endpoint actually
- * declares (see http_server.c's stream_channel_to_client, "video/mpeg")
- * gives Android enough to route straight to a playback handler, the
- * same way opening a downloaded .m3u file (whose own type,
+/* Both vlcLinkOrNull()/mpvLinkOrNull() are mobile-only. Desktop
+ * "vlc://"/"mpv://" links were tried and confirmed dead on a real PC
+ * -- neither app had registered itself as a URL protocol handler with
+ * the OS, and a browser has no way to launch a local program directly
+ * (deliberately: allowing that would let any website run arbitrary
+ * code on a visitor's machine). The .m3u download is the correct,
+ * reliable desktop mechanism instead -- file-type association is a
+ * real browser-safe handoff that doesn't depend on protocol-scheme
+ * registration, which is exactly why that one already works well
+ * there. So on desktop, only "copy" and "m3u" are offered.
+ *
+ * iOS Safari reliably hands off a bare "vlc://" URL to VLC (confirmed
+ * live). Android doesn't register that scheme the same way -- Chrome
+ * for Android instead needs the "intent://" URI format targeting a
+ * specific app's package name directly, the standard way web pages
+ * deep-link into an installed Android app. Confirmed live: without an
+ * explicit type=, the intent opened VLC but landed on its general
+ * browse screen instead of playing -- adding the MIME type this
+ * server's own stream endpoint actually declares (see
+ * http_server.c's stream_channel_to_client, "video/mpeg") gives
+ * Android enough to route straight to a playback handler, the same
+ * way opening a downloaded .m3u file (whose own type,
  * audio/x-mpegurl, is unambiguous) already does. */
-function vlcLink(url) {
-  if (/Android/i.test(navigator.userAgent || '')) {
+function vlcLinkOrNull(url) {
+  const ua = navigator.userAgent || '';
+  if (/Android/i.test(ua)) {
     const scheme = url.startsWith('https://') ? 'https' : 'http';
     const withoutScheme = url.replace(/^https?:\/\//, '');
     return `intent://${withoutScheme}#Intent;scheme=${scheme};type=video/mpeg;package=org.videolan.vlc;end`;
   }
-  return `vlc://${url}`;
+  if (/iPhone|iPad|iPod/i.test(ua)) return `vlc://${url}`;
+  return null;
 }
 
-/* Same pattern as vlcLink() above, for mpv-android (package is.xyz.mpv,
- * the standard/most common mpv port on Android -- confirmed convention,
- * same type=video/mpeg fix applied preemptively since it's the same
- * "app opens without knowing what to play" issue vlcLink() hit). The
- * iOS mpv port's URL scheme is less standardized than VLC's, so
- * Confirmed working on Android; there's no equivalently standardized
- * mpv port/scheme on iOS, so the mpv link is Android-only -- see
- * mpvLinkOrNull() below, which hides it everywhere else rather than
- * show a link that's confirmed not to go anywhere. */
+/* Same pattern as vlcLinkOrNull() above, for mpv-android's package
+ * (is.xyz.mpv) via the same intent:// + type=video/mpeg trick --
+ * confirmed working live. iOS has no standardized mpv port/scheme at
+ * all, and desktop mpv doesn't register one either (see the comment
+ * above), so this is Android-only. */
 function mpvLinkOrNull(url) {
-  if (!/Android/i.test(navigator.userAgent || '')) return null;
+  const ua = navigator.userAgent || '';
+  if (!/Android/i.test(ua)) return null;
   const scheme = url.startsWith('https://') ? 'https' : 'http';
   const withoutScheme = url.replace(/^https?:\/\//, '');
   return `intent://${withoutScheme}#Intent;scheme=${scheme};type=video/mpeg;package=is.xyz.mpv;end`;
@@ -208,11 +215,12 @@ async function loadLineup() {
     const items = await (await fetch('/lineup.json')).json();
     const el = document.getElementById('lineup');
     el.innerHTML = items.map(c => {
+      const vlcHref = vlcLinkOrNull(c.URL);
       const mpvHref = mpvLinkOrNull(c.URL);
       return `<div class="lineup-item"><span class="num">${escapeHtml(c.GuideNumber)}</span><span class="name">${escapeHtml(c.GuideName)}</span>` +
         `<button class="copy-btn small" data-url="${escapeHtml(c.URL)}">copy</button>` +
         `<a href="${c.URL}.m3u">m3u</a>` +
-        `<a href="${vlcLink(c.URL)}">vlc</a>` +
+        (vlcHref ? `<a href="${vlcHref}">vlc</a>` : '') +
         (mpvHref ? `<a href="${mpvHref}">mpv</a>` : '') +
         `</div>`;
     }).join('') || '<div class="muted">No channels yet.</div>';
