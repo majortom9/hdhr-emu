@@ -38,6 +38,8 @@ install: $(BIN)
 	install -Dm755 $(BIN) /usr/local/bin/$(BIN)
 	install -Dm644 systemd/hdhr-emu.service /etc/systemd/system/hdhr-emu.service
 	[ -f /etc/hdhr-emu.conf ] || install -Dm644 config/hdhr-emu.conf.example /etc/hdhr-emu.conf
+	install -d /usr/local/share/hdhr-emu/web
+	install -m644 web/index.html web/style.css web/app.js -t /usr/local/share/hdhr-emu/web
 	setcap 'cap_net_bind_service=+ep' /usr/local/bin/$(BIN) || true
 	systemctl daemon-reload
 	@echo "Edit /etc/hdhr-emu.conf, then: systemctl enable --now hdhr-emu"

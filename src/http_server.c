@@ -33,6 +33,7 @@
 #include "dvb_stream.h"
 #include "tuner.h"
 #include "control.h"
+#include "web_ui.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -118,6 +119,35 @@ static void handle_discover_json(int fd, const struct hdhr_config *cfg)
         cfg->friendly_name, cfg->model, cfg->firmware_name, cfg->firmware_version,
         cfg->device_id, ip, ip, cfg->tuner_count);
     send_json(fd, json);
+}
+
+/* Wraps a channel's /auto/vX.X stream URL in a tiny M3U playlist --
+ * most browsers can't play a raw MPEG-TS URL directly, but handing
+ * off a downloaded .m3u file lets the OS/browser dispatch it to
+ * whatever's registered to open one (VLC, mpv, etc.), same trick real
+ * HDHomeRun web UIs use. Content-Disposition forces a download rather
+ * than an inline text render, since not every browser recognizes the
+ * M3U mime type well enough to hand it off on its own. */
+static void handle_m3u(int fd, const struct hdhr_config *cfg, int major, int minor)
+{
+    (void)cfg;
+    const struct dvb_channel *ch = dvb_find_channel(major, minor);
+    char ip[16];
+    if (local_ip_for_peer(fd, ip, sizeof(ip)) != 0) snprintf(ip, sizeof(ip), "0.0.0.0");
+
+    char body[512];
+    int blen = snprintf(body, sizeof(body),
+        "#EXTM3U\n#EXTINF:-1,%d.%d %s\nhttp://%s:80/auto/v%d.%d\n",
+        major, minor, ch ? ch->short_name : "Unknown", ip, major, minor);
+
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: audio/x-mpegurl\r\n"
+        "Content-Disposition: attachment; filename=\"%d.%d.m3u\"\r\n"
+        "Content-Length: %d\r\nConnection: close\r\nServer: hdhr-emu\r\n\r\n",
+        major, minor, blen);
+    if (write(fd, hdr, (size_t)hlen) < 0) { /* client already gone */ }
+    if (write(fd, body, (size_t)blen) < 0) { /* client already gone */ }
 }
 
 static void handle_lineup_status_json(int fd)
@@ -242,22 +272,84 @@ out:
     tuner_release(t); /* closes ds internally */
 }
 
+/* Only the web UI's /api/tuner<N>/channel route (web_ui.c) accepts
+ * POST; every route below stays GET-only, same as before. Small
+ * bodies only (a channel string, well under sizeof(body)) -- this
+ * server has no chunked-encoding support, matching its existing
+ * minimal-HTTP-parser scope. Assumes standard "Content-Length:"
+ * casing, which is what every browser's fetch()/XHR actually sends --
+ * the only client this route needs to serve. Takes the already-located
+ * end-of-headers pointer (see handle_request()'s own header-reading
+ * loop -- a single read() is *not* guaranteed to capture the whole
+ * header block: confirmed live, a stray ~3KB Cookie header left over
+ * from an unrelated earlier service on this same hostname pushed the
+ * real POST body past what a fixed single read() ever saw, so the
+ * body-extraction below used to silently grab leftover header bytes
+ * instead of the actual value). */
+static void handle_post_body(int fd, const char *req, size_t req_len, const char *hdr_end,
+                              char *body, size_t body_cap, size_t *body_len_out)
+{
+    size_t body_len = 0;
+    const char *body_start = hdr_end + 4;
+    size_t already = (size_t)((req + req_len) - body_start);
+    if (already > body_cap) already = body_cap;
+    memcpy(body, body_start, already);
+    body_len = already;
+
+    const char *cl = strstr(req, "Content-Length:");
+    long content_length = cl ? atol(cl + 15) : (long)body_len;
+    if (content_length < 0) content_length = 0;
+    if ((size_t)content_length > body_cap) content_length = (long)body_cap;
+    while (body_len < (size_t)content_length) {
+        ssize_t got = read(fd, body + body_len, (size_t)content_length - body_len);
+        if (got <= 0) break;
+        body_len += (size_t)got;
+    }
+    *body_len_out = body_len;
+}
+
 static void handle_request(int fd, struct hdhr_config *cfg, struct hdhr_tuner *tuners)
 {
-    char req[2048] = {0};
-    ssize_t n = read(fd, req, sizeof(req) - 1);
-    if (n <= 0) return;
+    /* Read until the full header block is in hand ("\r\n\r\n" found),
+     * not just one read() -- headers can legitimately span multiple
+     * TCP segments (large cookies, many Accept/Sec-prefixed headers
+     * from a real browser, etc.), and both the request-line parse and
+     * the POST body logic below need the complete, correctly-
+     * terminated header block to work from. Bounded so a client that
+     * never sends a terminator can't hold a connection thread forever. */
+    char req[8192] = {0};
+    size_t req_len = 0;
+    char *hdr_end = NULL;
+    while (req_len < sizeof(req) - 1) {
+        ssize_t n = read(fd, req + req_len, sizeof(req) - 1 - req_len);
+        if (n <= 0) { if (req_len == 0) return; break; }
+        req_len += (size_t)n;
+        req[req_len] = '\0';
+        hdr_end = strstr(req, "\r\n\r\n");
+        if (hdr_end) break;
+    }
+    if (!hdr_end) { send_headers(fd, "431 Request Header Fields Too Large", "text/plain", 0); return; }
 
     char method[8] = {0}, path[512] = {0};
     if (sscanf(req, "%7s %511s", method, path) != 2) return;
-    if (strcmp(method, "GET") != 0) {
-        send_headers(fd, "405 Method Not Allowed", "text/plain", 0);
-        return;
-    }
 
     /* strip query string for routing */
     char *qs = strchr(path, '?');
     if (qs) *qs = '\0';
+
+    if (strcmp(method, "POST") == 0) {
+        char body[512] = {0};
+        size_t body_len = 0;
+        handle_post_body(fd, req, req_len, hdr_end, body, sizeof(body), &body_len);
+        if (!web_ui_try_handle(fd, cfg, method, path, body, body_len)) {
+            send_headers(fd, "405 Method Not Allowed", "text/plain", 0);
+        }
+        return;
+    }
+    if (strcmp(method, "GET") != 0) {
+        send_headers(fd, "405 Method Not Allowed", "text/plain", 0);
+        return;
+    }
 
     if (strcmp(path, "/discover.json") == 0) {
         handle_discover_json(fd, cfg);
@@ -266,9 +358,14 @@ static void handle_request(int fd, struct hdhr_config *cfg, struct hdhr_tuner *t
     } else if (strcmp(path, "/lineup.json") == 0) {
         handle_lineup_json(fd, cfg);
     } else if (strncmp(path, "/auto/v", 7) == 0) {
+        size_t plen = strlen(path);
         int major = 0, minor = 0;
         sscanf(path + 7, "%d.%d", &major, &minor);
-        stream_channel_to_client(fd, cfg, tuners, -1, major, minor);
+        if (plen > 4 && strcmp(path + plen - 4, ".m3u") == 0) {
+            handle_m3u(fd, cfg, major, minor);
+        } else {
+            stream_channel_to_client(fd, cfg, tuners, -1, major, minor);
+        }
     } else {
         int idx = -1, major = 0, minor = 0, consumed = 0;
         if (sscanf(path, "/tuner%d%n", &idx, &consumed) == 1 &&
@@ -278,7 +375,7 @@ static void handle_request(int fd, struct hdhr_config *cfg, struct hdhr_tuner *t
             } else {
                 stream_channel_to_client(fd, cfg, tuners, idx, major, minor);
             }
-        } else {
+        } else if (!web_ui_try_handle(fd, cfg, method, path, NULL, 0)) {
             send_404(fd);
         }
     }

@@ -53,6 +53,14 @@ struct hdhr_config {
      * stays current. Empty string (the default) disables caching
      * entirely — nothing is loaded or written. */
     char     channel_cache_file[256];
+
+    /* Directory holding the web UI's static files (web/index.html,
+     * style.css, app.js — see web_ui.c). Defaults to
+     * /usr/local/share/hdhr-emu/web, matching where `make install`
+     * copies web/'s contents. Serving from disk rather than embedding
+     * these in the binary means the UI can be tweaked without a
+     * recompile. */
+    char     web_root[256];
 };
 
 void config_defaults(struct hdhr_config *cfg);

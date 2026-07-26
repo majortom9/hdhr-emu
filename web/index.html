@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hdhr-emu</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1 id="device-name">hdhr-emu</h1>
+  <div id="device-sub" class="muted"></div>
+</header>
+
+<main>
+  <section id="tuners"></section>
+
+  <section id="lineup-section">
+    <h2>Lineup <button id="lineup-refresh" class="small">Refresh</button></h2>
+    <div id="lineup"></div>
+  </section>
+</main>
+
+<template id="tuner-card-template">
+  <div class="card tuner-card">
+    <div class="tuner-head">
+      <h2>Tuner <span class="idx"></span></h2>
+      <span class="vchannel"></span>
+    </div>
+    <div class="phys muted"></div>
+
+    <div class="bars">
+      <div class="bar-row">
+        <label>Signal Strength</label>
+        <div class="bar"><div class="bar-fill ss"></div><span class="bar-pct ss-pct"></span></div>
+      </div>
+      <div class="bar-row">
+        <label>Signal Quality</label>
+        <div class="bar"><div class="bar-fill snq"></div><span class="bar-pct snq-pct"></span></div>
+      </div>
+      <div class="bar-row">
+        <label>Symbol Quality</label>
+        <div class="bar"><div class="bar-fill seq"></div><span class="bar-pct seq-pct"></span></div>
+      </div>
+    </div>
+    <div class="rate muted"></div>
+
+    <div class="found-list"></div>
+
+    <div class="controls">
+      <select class="channelmap">
+        <option value="us-bcast">us-bcast</option>
+      </select>
+      <input type="number" class="chnum" min="2" max="36" placeholder="channel #">
+      <button class="tune-btn">Set</button>
+      <button class="scan-btn">Scan</button>
+      <button class="scan-stop-btn" hidden>Stop</button>
+      <button class="release-btn secondary">Release</button>
+    </div>
+    <div class="scan-status muted"></div>
+  </div>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>

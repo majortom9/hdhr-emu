@@ -61,6 +61,12 @@ scan_on_startup=1
 # Leave unset to disable caching entirely.
 #channel_cache_file=/var/lib/hdhr-emu/channels.cache
 
+# Directory holding the web UI's static files (index.html/style.css/
+# app.js) -- a phone/browser-friendly status+control dashboard served
+# at http://<this box>/. `make install` copies web/'s contents here by
+# default, so this normally doesn't need to be set.
+#web_root=/usr/local/share/hdhr-emu/web
+
 # When trying to calibrate signal_strength_pct ("ss=") against a real
 # HDHomeRun's readings, set this to 1 and watch stderr — logs the raw
 # scale type and value your DVB driver actually reports for
