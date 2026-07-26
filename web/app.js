@@ -1,5 +1,18 @@
-const state = { scanning: {} };
+const state = { scanning: {}, chartData: {}, tunerCount: 0, chartWindowSec: 60, chartIntervalId: null };
 const ATSC_RF_MIN = 2, ATSC_RF_MAX = 36;
+/* Signal-trend chart: always exactly 60 points/line -- what varies is
+ * the window they're spread over (the <select class="chart-window">
+ * in each chart card, shared across all tuners, see setChartWindow()).
+ * Longer windows sample *less* often rather than holding more points,
+ * deliberately: signal strength/quality on a fixed antenna doesn't
+ * meaningfully move sample-to-sample within a second or two unless
+ * something's actively flaky, so a 5-minute view doesn't need 5x the
+ * requests just because it covers more time -- it needs the same 60
+ * points spread thinner (see /api/tuner<N>/stats.json, a lightweight
+ * companion to /api/tuners.json that skips the vchannel/streaminfo
+ * GETSET calls the full dashboard poll makes, specifically so this
+ * faster poll doesn't multiply those for no benefit). */
+const CHART_MAX_POINTS = 60;
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -18,22 +31,41 @@ async function loadDeviceInfo() {
     document.getElementById('device-name').textContent = `hdhr-emu — ${d.FriendlyName}`;
     document.getElementById('device-sub').textContent =
       `${d.ModelNumber} · Device ID ${d.DeviceID} · ${d.TunerCount} tuner(s)`;
+    state.tunerCount = d.TunerCount || 0;
   } catch (e) { /* transient -- next poll cycle isn't scheduled for this, just leave the default title */ }
 }
 
+/* The template's root is a .tuner-row wrapping two separate, equally-
+ * sized .card elements side by side (.tuner-card, .chart-card) --
+ * kept as two real cards rather than one card split internally so
+ * they visually read as independent boxes, not one box with a
+ * sub-panel. Returns the .tuner-card specifically, since that's what
+ * every other function here already expects (status/control fields
+ * live there) -- use ensureChartCard(idx) for the chart's own card. */
 function ensureTunerCard(idx) {
   let card = document.querySelector(`.tuner-card[data-idx="${idx}"]`);
   if (card) return card;
   const tpl = document.getElementById('tuner-card-template');
-  card = tpl.content.firstElementChild.cloneNode(true);
+  const row = tpl.content.firstElementChild.cloneNode(true);
+  card = row.querySelector('.tuner-card');
+  const chartCard = row.querySelector('.chart-card');
   card.dataset.idx = idx;
+  chartCard.dataset.idx = idx;
   card.querySelector('.idx').textContent = idx;
   card.querySelector('.tune-btn').addEventListener('click', () => onTune(idx));
   card.querySelector('.scan-btn').addEventListener('click', () => onScanStart(idx));
   card.querySelector('.scan-stop-btn').addEventListener('click', () => onScanStop(idx));
   card.querySelector('.release-btn').addEventListener('click', () => onRelease(idx));
-  document.getElementById('tuners').appendChild(card);
+  const windowSelect = chartCard.querySelector('.chart-window');
+  windowSelect.value = state.chartWindowSec;
+  windowSelect.addEventListener('change', (e) => setChartWindow(parseInt(e.target.value, 10)));
+  document.getElementById('tuners').appendChild(row);
   return card;
+}
+
+function ensureChartCard(idx) {
+  ensureTunerCard(idx); /* guarantees the row (and this card within it) exists */
+  return document.querySelector(`.chart-card[data-idx="${idx}"]`);
 }
 
 function pctClass(pct) {
@@ -80,6 +112,76 @@ async function pollTuners() {
     const d = await (await fetch('/api/tuners.json')).json();
     d.tuners.forEach(renderTuner);
   } catch (e) { /* transient network hiccup -- next tick tries again */ }
+}
+
+/* Maps a rolling array of 0-100 values onto the chart's 300x60 SVG
+ * viewBox. x is spread across the *full configured window*
+ * (CHART_MAX_POINTS), not just however many samples exist so far --
+ * so a chart that just started (or just reset after a channel change)
+ * shows a short segment growing from the left rather than a
+ * misleadingly-stretched line filling the whole width from only a
+ * couple of points. */
+function svgPoints(arr) {
+  const w = 300, h = 60;
+  return arr.map((v, i) => {
+    const x = (i / (CHART_MAX_POINTS - 1)) * w;
+    const y = h - (Math.max(0, Math.min(100, v)) / 100) * h;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+}
+
+/* Runs on its own interval (spacing depends on the chosen window --
+ * see setChartWindow()), separate from pollTuners()'s fuller 2s
+ * refresh -- see the CHART_MAX_POINTS comment up top for why. History
+ * resets whenever a tuner's physical_channel changes (comparing
+ * dBm/pct trends across two different channels in one continuous line
+ * would be meaningless) or when it's untuned (lock=none), which also
+ * hides the chart entirely until it's tuned again. */
+async function pollCharts() {
+  for (let i = 0; i < state.tunerCount; i++) {
+    try {
+      const t = await (await fetch(`/api/tuner${i}/stats.json`)).json();
+      const chartCard = ensureChartCard(i);
+      let cd = state.chartData[i];
+      if (!cd) cd = state.chartData[i] = { ss: [], snq: [], lastPhysical: null };
+
+      if (!t.lock || t.lock === 'none') {
+        chartCard.hidden = true;
+        cd.ss = []; cd.snq = []; cd.lastPhysical = null;
+        continue;
+      }
+
+      if (cd.lastPhysical !== t.physical_channel) {
+        cd.ss = []; cd.snq = [];
+        cd.lastPhysical = t.physical_channel;
+      }
+
+      cd.ss.push(t.signal_strength_pct || 0);
+      cd.snq.push(t.signal_quality_pct || 0);
+      if (cd.ss.length > CHART_MAX_POINTS) cd.ss.shift();
+      if (cd.snq.length > CHART_MAX_POINTS) cd.snq.shift();
+
+      chartCard.hidden = false;
+      chartCard.querySelector('.chart-ss').setAttribute('points', svgPoints(cd.ss));
+      chartCard.querySelector('.chart-snq').setAttribute('points', svgPoints(cd.snq));
+    } catch (e) { /* transient -- next tick tries again */ }
+  }
+}
+
+/* Shared across every tuner's chart -- one window setting, not a
+ * per-tuner preference, so all instances of the <select> stay in
+ * sync no matter which one the user actually touched. History is
+ * cleared on a window change since old samples were spaced at the
+ * previous interval; mixing spacings in one line would misrepresent
+ * elapsed time between points. */
+function setChartWindow(sec) {
+  state.chartWindowSec = sec;
+  state.chartData = {};
+  document.querySelectorAll('.chart-window').forEach(sel => { sel.value = sec; });
+  if (state.chartIntervalId) clearInterval(state.chartIntervalId);
+  const ms = Math.round((sec * 1000) / CHART_MAX_POINTS);
+  state.chartIntervalId = setInterval(pollCharts, ms);
+  pollCharts();
 }
 
 async function setChannel(idx, value) {
@@ -253,3 +355,4 @@ loadDeviceInfo();
 loadLineup();
 pollTuners();
 setInterval(pollTuners, 2000);
+setChartWindow(state.chartWindowSec);

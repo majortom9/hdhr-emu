@@ -22,42 +22,66 @@
 </main>
 
 <template id="tuner-card-template">
-  <div class="card tuner-card">
-    <div class="tuner-head">
-      <h2>Tuner <span class="idx"></span></h2>
-      <span class="vchannel"></span>
-    </div>
-    <div class="phys muted"></div>
-
-    <div class="bars">
-      <div class="bar-row">
-        <label>Signal Strength</label>
-        <div class="bar"><div class="bar-fill ss"></div><span class="bar-pct ss-pct"></span></div>
+  <div class="tuner-row">
+    <div class="card tuner-card">
+      <div class="tuner-head">
+        <h2>Tuner <span class="idx"></span></h2>
+        <span class="vchannel"></span>
       </div>
-      <div class="bar-row">
-        <label>Signal Quality</label>
-        <div class="bar"><div class="bar-fill snq"></div><span class="bar-pct snq-pct"></span></div>
+      <div class="phys muted"></div>
+
+      <div class="bars">
+        <div class="bar-row">
+          <label>Signal Strength</label>
+          <div class="bar"><div class="bar-fill ss"></div><span class="bar-pct ss-pct"></span></div>
+        </div>
+        <div class="bar-row">
+          <label>Signal Quality</label>
+          <div class="bar"><div class="bar-fill snq"></div><span class="bar-pct snq-pct"></span></div>
+        </div>
+        <div class="bar-row">
+          <label>Symbol Quality</label>
+          <div class="bar"><div class="bar-fill seq"></div><span class="bar-pct seq-pct"></span></div>
+        </div>
       </div>
-      <div class="bar-row">
-        <label>Symbol Quality</label>
-        <div class="bar"><div class="bar-fill seq"></div><span class="bar-pct seq-pct"></span></div>
+      <div class="rate muted"></div>
+
+      <div class="found-list"></div>
+
+      <div class="controls">
+        <select class="channelmap">
+          <option value="us-bcast">us-bcast</option>
+        </select>
+        <input type="number" class="chnum" min="2" max="36" placeholder="channel #">
+        <button class="tune-btn">Set</button>
+        <button class="scan-btn">Scan</button>
+        <button class="scan-stop-btn" hidden>Stop</button>
+        <button class="release-btn secondary">Release</button>
+      </div>
+      <div class="scan-status muted"></div>
+    </div>
+
+    <div class="card chart-card" hidden>
+      <div class="chart-head">
+        <h2>Signal Trend</h2>
+        <select class="chart-window">
+          <option value="60">last 60s</option>
+          <option value="300">last 5 min</option>
+          <option value="900">last 15 min</option>
+          <option value="1800">last 30 min</option>
+          <option value="3600">last hour</option>
+        </select>
+      </div>
+      <svg class="chart" viewBox="0 0 300 60" preserveAspectRatio="none">
+        <line x1="0" y1="30" x2="300" y2="30" class="chart-midline"></line>
+        <polyline class="chart-line chart-ss" points=""></polyline>
+        <polyline class="chart-line chart-snq" points=""></polyline>
+      </svg>
+      <div class="chart-legend">
+        <span class="chart-key ss">signal strength</span>
+        <span class="chart-key snq">signal quality</span>
       </div>
     </div>
-    <div class="rate muted"></div>
-
-    <div class="found-list"></div>
-
-    <div class="controls">
-      <select class="channelmap">
-        <option value="us-bcast">us-bcast</option>
-      </select>
-      <input type="number" class="chnum" min="2" max="36" placeholder="channel #">
-      <button class="tune-btn">Set</button>
-      <button class="scan-btn">Scan</button>
-      <button class="scan-stop-btn" hidden>Stop</button>
-      <button class="release-btn secondary">Release</button>
-    </div>
-    <div class="scan-status muted"></div>
   </div>
 </template>
 

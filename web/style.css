@@ -8,6 +8,7 @@
   --red: #d3392f;
   --yellow: #d6a218;
   --green: #2f9e44;
+  --chart2: #a349d6;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -20,6 +21,7 @@
     --red: #e5564b;
     --yellow: #e8b93a;
     --green: #43c059;
+    --chart2: #c07ae8;
   }
 }
 
@@ -39,7 +41,7 @@ header h1 { margin: 0; font-size: 1.4rem; }
 .muted { color: var(--muted); font-size: 0.85rem; }
 
 main {
-  max-width: 640px;
+  max-width: 1400px;
   margin: 0 auto;
   padding: 0 0.75rem;
 }
@@ -50,6 +52,26 @@ main {
   border-radius: 10px;
   padding: 0.9rem 1rem;
   margin-bottom: 0.9rem;
+}
+
+/* Each tuner gets a row of two equally-sized, independent cards side
+ * by side (the tuner's own status/controls, and its signal chart),
+ * not one card with a sub-panel -- dropping to a stacked single
+ * column via flex-wrap once there isn't room for both at a readable
+ * size (a phone, or multiple tuner rows competing for width on a
+ * still-fairly-wide but not desktop-class screen), no separate mobile
+ * media query needed. */
+.tuner-row { display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: stretch; margin-bottom: 0.9rem; }
+.tuner-row .card { flex: 1 1 380px; min-width: 320px; margin-bottom: 0; }
+.chart-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 0.6rem; }
+.chart-head h2 { margin: 0; font-size: 1.05rem; }
+.chart-window {
+  font-size: 0.75rem;
+  padding: 0.2rem 0.4rem;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+  color: var(--text);
 }
 
 .tuner-head { display: flex; align-items: baseline; justify-content: space-between; }
@@ -87,6 +109,43 @@ main {
 }
 
 .rate { margin-top: 0.45rem; }
+
+/* chart-card is a flex column so .chart (no fixed height) grows to
+ * fill whatever's left after the heading/legend -- combined with
+ * .tuner-row's align-items:stretch, this naturally matches the
+ * tuner-card's actual height instead of guessing a fixed rem value
+ * that would either leave the chart looking short or overflow. */
+.chart-card { display: flex; flex-direction: column; }
+.chart {
+  width: 100%;
+  flex: 1;
+  min-height: 10rem;
+  display: block;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.chart-midline { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.chart-line {
+  fill: none;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+.chart-line.chart-ss { stroke: var(--accent); }
+.chart-line.chart-snq { stroke: var(--chart2); }
+.chart-legend { margin-top: 0.25rem; font-size: 0.75rem; display: flex; gap: 0.75rem; }
+.chart-key { position: relative; padding-left: 1rem; color: var(--muted); }
+.chart-key::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.4em;
+  width: 0.7rem;
+  height: 0.15rem;
+  border-radius: 1px;
+}
+.chart-key.ss::before { background: var(--accent); }
+.chart-key.snq::before { background: var(--chart2); }
 
 .found-list { margin-top: 0.6rem; font-size: 0.85rem; max-height: 8rem; overflow-y: auto; }
 .found-list .found-item { display: flex; gap: 0.5rem; padding: 0.1rem 0; }

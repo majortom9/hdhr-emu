@@ -193,6 +193,43 @@ static void handle_tuners_json(int fd, const struct hdhr_config *cfg)
     free(buf);
 }
 
+/* Lightweight companion to /api/tuners.json, for the web UI's signal
+ * trend chart -- that polls much faster (every ~1s vs. the full
+ * dashboard's 2s), so it deliberately skips the vchannel/streaminfo
+ * GETSET calls append_tuner_json() also makes, which the chart has no
+ * use for and which would otherwise multiply the loopback round-trips
+ * a fast poll makes for no benefit. Includes physical_channel/lock so
+ * the chart can detect a channel change (and reset its history) or an
+ * untuned tuner (and hide itself) without needing to correlate against
+ * the separate, independently-timed /api/tuners.json poll. */
+static void handle_stats_json(int fd, int idx)
+{
+    char name[32], status[512], err[128];
+    snprintf(name, sizeof(name), "/tuner%d/status", idx);
+    if (!getset_client_call(name, NULL, status, sizeof(status), err, sizeof(err))) {
+        snprintf(status, sizeof(status), "ch=none lock=none ss=0 snq=0 seq=0");
+    }
+
+    char physical[64] = "none", lock[16] = "none";
+    token_str(status, "ch=", physical, sizeof(physical));
+    token_str(status, "lock=", lock, sizeof(lock));
+    int ss = token_int(status, "ss=", 0);
+    int snq = token_int(status, "snq=", 0);
+    int seq = token_int(status, "seq=", 0);
+
+    char json[256];
+    size_t off = 0;
+    off += (size_t)snprintf(json, sizeof(json), "{\"index\":%d,\"physical_channel\":\"", idx);
+    json_escape_append(json, sizeof(json), &off, physical);
+    off += (size_t)snprintf(json + off, sizeof(json) - off, "\",\"lock\":\"");
+    json_escape_append(json, sizeof(json), &off, lock);
+    off += (size_t)snprintf(json + off, sizeof(json) - off,
+        "\",\"signal_strength_pct\":%d,\"signal_quality_pct\":%d,\"symbol_quality_pct\":%d}\n",
+        ss, snq, seq);
+
+    send_body(fd, "200 OK", "application/json", json, off);
+}
+
 /* POST /tuner<N>/channel body -- accepts either a bare value
  * ("us-bcast:25") or "value=us-bcast:25" (a browser
  * <form>/URLSearchParams POST would send the latter); tolerate both
@@ -302,6 +339,15 @@ bool web_ui_try_handle(int fd, const struct hdhr_config *cfg,
     }
 
     int idx = -1, consumed = 0;
+    if (strcmp(method, "GET") == 0 &&
+        sscanf(path, "/api/tuner%d/stats.json%n", &idx, &consumed) == 1 &&
+        path[consumed] == '\0') {
+        if (idx < 0 || idx >= cfg->tuner_count) { send_404(fd); return true; }
+        handle_stats_json(fd, idx);
+        return true;
+    }
+
+    idx = -1; consumed = 0;
     if (strcmp(method, "POST") == 0 &&
         sscanf(path, "/api/tuner%d/channel%n", &idx, &consumed) == 1 &&
         path[consumed] == '\0') {
