@@ -147,17 +147,90 @@ function onScanStop(idx) {
   state.scanning[idx] = false;
 }
 
+/* This daemon is served over plain HTTP (no TLS), and the modern
+ * navigator.clipboard API is restricted to secure contexts in most
+ * browsers -- so copy uses the older execCommand fallback directly
+ * rather than assuming clipboard.writeText() is available. */
+function copyToClipboard(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try { document.execCommand('copy'); } catch (e) { /* nothing more we can do */ }
+  document.body.removeChild(ta);
+}
+
+/* iOS Safari reliably hands off a bare "vlc://" URL to VLC, but VLC
+ * for Android doesn't register that scheme the same way -- confirmed
+ * live (VLC installed on both, vlc:// worked on iPhone, silently did
+ * nothing on Android). Chrome for Android instead has first-class
+ * support for "intent://" URIs targeting a specific app's package
+ * name directly, which is the standard way web pages deep-link into
+ * an installed Android app. Desktop VLC also registers vlc://, so
+ * that's the fallback for anything that isn't detected as Android.
+ * Confirmed live: without an explicit type=, the intent opened VLC
+ * but landed on its general browse screen instead of playing --
+ * adding the MIME type this server's own stream endpoint actually
+ * declares (see http_server.c's stream_channel_to_client, "video/mpeg")
+ * gives Android enough to route straight to a playback handler, the
+ * same way opening a downloaded .m3u file (whose own type,
+ * audio/x-mpegurl, is unambiguous) already does. */
+function vlcLink(url) {
+  if (/Android/i.test(navigator.userAgent || '')) {
+    const scheme = url.startsWith('https://') ? 'https' : 'http';
+    const withoutScheme = url.replace(/^https?:\/\//, '');
+    return `intent://${withoutScheme}#Intent;scheme=${scheme};type=video/mpeg;package=org.videolan.vlc;end`;
+  }
+  return `vlc://${url}`;
+}
+
+/* Same pattern as vlcLink() above, for mpv-android (package is.xyz.mpv,
+ * the standard/most common mpv port on Android -- confirmed convention,
+ * same type=video/mpeg fix applied preemptively since it's the same
+ * "app opens without knowing what to play" issue vlcLink() hit). The
+ * iOS mpv port's URL scheme is less standardized than VLC's, so
+ * Confirmed working on Android; there's no equivalently standardized
+ * mpv port/scheme on iOS, so the mpv link is Android-only -- see
+ * mpvLinkOrNull() below, which hides it everywhere else rather than
+ * show a link that's confirmed not to go anywhere. */
+function mpvLinkOrNull(url) {
+  if (!/Android/i.test(navigator.userAgent || '')) return null;
+  const scheme = url.startsWith('https://') ? 'https' : 'http';
+  const withoutScheme = url.replace(/^https?:\/\//, '');
+  return `intent://${withoutScheme}#Intent;scheme=${scheme};type=video/mpeg;package=is.xyz.mpv;end`;
+}
+
 async function loadLineup() {
   try {
     const items = await (await fetch('/lineup.json')).json();
     const el = document.getElementById('lineup');
-    el.innerHTML = items.map(c =>
-      `<div class="lineup-item"><span class="num">${escapeHtml(c.GuideNumber)}</span><span class="name">${escapeHtml(c.GuideName)}</span><a href="${c.URL}.m3u">play</a></div>`
-    ).join('') || '<div class="muted">No channels yet.</div>';
+    el.innerHTML = items.map(c => {
+      const mpvHref = mpvLinkOrNull(c.URL);
+      return `<div class="lineup-item"><span class="num">${escapeHtml(c.GuideNumber)}</span><span class="name">${escapeHtml(c.GuideName)}</span>` +
+        `<button class="copy-btn small" data-url="${escapeHtml(c.URL)}">copy</button>` +
+        `<a href="${c.URL}.m3u">m3u</a>` +
+        `<a href="${vlcLink(c.URL)}">vlc</a>` +
+        (mpvHref ? `<a href="${mpvHref}">mpv</a>` : '') +
+        `</div>`;
+    }).join('') || '<div class="muted">No channels yet.</div>';
   } catch (e) {
     document.getElementById('lineup').innerHTML = '<div class="muted">Couldn’t load lineup.</div>';
   }
 }
+
+/* Delegated once on the container rather than re-attached after every
+ * loadLineup() re-render (which replaces the whole innerHTML). */
+document.getElementById('lineup').addEventListener('click', (e) => {
+  const btn = e.target.closest('.copy-btn');
+  if (!btn) return;
+  copyToClipboard(btn.dataset.url);
+  const orig = btn.textContent;
+  btn.textContent = 'copied!';
+  setTimeout(() => { btn.textContent = orig; }, 1200);
+});
 
 document.getElementById('lineup-refresh').addEventListener('click', loadLineup);
 
