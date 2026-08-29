@@ -42,16 +42,35 @@
 #define TS_PER_DATAGRAM  7
 #define DATAGRAM_SIZE    (TS_PACKET_SIZE * TS_PER_DATAGRAM) /* 1316 */
 
-/* How long to wait for the tuner to free up (target_channel_wait) or for
- * dvb_channel_db to pick up the current mux (see udp_push_start()'s own
- * comment for why the latter is needed at all) before giving up.
- * Comfortably under a real client's own single-attempt reply patience
- * (libhdhomerun's HDHOMERUN_CONTROL_RECV_TIMEOUT is 2500ms, confirmed by
- * reading hdhomerun_control.c directly — the /tunerN/target SET goes
- * through the same generic GETSET mechanism as /tunerN/channel, so the
- * same ceiling applies here). */
+/* How long udp_push_start() itself will retry the dvb_channel_db lookup
+ * (see its own comment for why the lookup is needed at all) before giving
+ * up. This runs on the connection thread that's about to reply to the
+ * client's /tunerN/target SET, so it's genuinely bounded by a real
+ * client's own single-attempt reply patience (libhdhomerun's
+ * HDHOMERUN_CONTROL_RECV_TIMEOUT is 2500ms, confirmed by reading
+ * hdhomerun_control.c directly — /tunerN/target goes through the same
+ * generic GETSET mechanism as /tunerN/channel, so the same ceiling
+ * applies here). Comfortably under that ceiling. */
 #define TARGET_CHANNEL_WAIT_MS 2000
 #define TARGET_CHANNEL_POLL_MS 50
+
+/* How long push_thread_main() will wait for the tuner claim to free up
+ * (tuner_try_claim_wait() below). This runs on push_thread_main's own
+ * background thread, spawned *after* udp_push_start() has already replied
+ * to the client -- unlike TARGET_CHANNEL_WAIT_MS above, nothing bounds
+ * this to the client's reply patience, so it can and should cover the
+ * real worst case of channel_scan_thread_main's hold (control.c):
+ * tune_and_lock + a deliberate 600ms settle sleep + read_psip. Originally
+ * shared TARGET_CHANNEL_WAIT_MS's 2000ms value, sized only for "a few
+ * hundred ms" of leftover PSIP-read tail -- confirmed live (2026-08-28)
+ * that this undercounts a slow tune_and_lock: a real attempt logged
+ * tune_and_lock() alone taking 3185ms, so the claim was still held well
+ * past the 2000ms wait, and udp_stream logged "still in use after
+ * waiting, refusing target= push" on a channel that had, in fact, locked
+ * successfully moments later -- a real server-side bug, not a client-side
+ * timing-margin issue. Raised with real margin over the worst observed
+ * total (tune_and_lock 3185ms + 600ms settle + read_psip 387ms ≈ 4.2s). */
+#define TARGET_CLAIM_WAIT_MS 8000
 
 struct push_ctx {
     struct hdhr_config cfg; /* snapshot, so config reloads mid-stream don't race us */
@@ -98,7 +117,7 @@ static void *push_thread_main(void *arg)
      * already replied to the client by the time we get here), so
      * waiting doesn't cost the client anything. */
     int reused_fd = -1;
-    if (!tuner_try_claim_wait(t, TARGET_CHANNEL_WAIT_MS, ctx->channel.frequency_hz,
+    if (!tuner_try_claim_wait(t, TARGET_CLAIM_WAIT_MS, ctx->channel.frequency_hz,
                                ctx->channel.delivery, &reused_fd)) {
         fprintf(stderr, "udp_stream: tuner%d: still in use after waiting, "
                          "refusing target= push\n", t->index);

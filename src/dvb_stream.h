@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include "dvb_channel.h"
+#include "dvb_frontend.h"
 
 /* program_override semantics, matching the real /tunerN/program GETSET:
  *   DVB_PROGRAM_DEFAULT  — stream the channel's own program (normal case)
@@ -75,10 +76,18 @@ ssize_t dvb_stream_read(struct dvb_stream *s, void *buf, size_t len);
 
 void dvb_stream_close(struct dvb_stream *s);
 
-/* Read-only access to the underlying frontend fd, so callers (control.c's
- * /tunerN/status) can pull live S2API signal stats while a stream is
- * open. Do not close or tune this fd directly — dvb_stream owns it. */
-int dvb_stream_frontend_fd(const struct dvb_stream *s);
+/* Live signal stats for a caller (control.c's /tunerN/status) that wants
+ * them while this stream is open — reads a cache kept fresh by a
+ * background thread (see dvb_stream.c's stats_thread_main) rather than
+ * calling dvb_frontend_read_stats() on the frontend fd directly.
+ * Deliberately no raw-fd accessor exists for this anymore: that ioctl is
+ * confirmed to block for multiple seconds on some hardware, which is
+ * exactly what this cache exists to keep off any connection thread — see
+ * stats_thread's own comment in the struct definition. Returns false (out
+ * left untouched) if the background thread hasn't published a first
+ * reading yet (stream just opened) or failed to start at all — callers
+ * should show a "still checking" placeholder rather than a stale zero. */
+bool dvb_stream_get_cached_stats(struct dvb_stream *s, struct dvb_signal_stats *out);
 
 /* Live throughput since dvb_stream_open(), for the status/streaminfo
  * "bps="/"pps=" fields real hdhomerun_config(_gui) actually parses (see

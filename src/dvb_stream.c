@@ -91,6 +91,27 @@ struct dvb_stream {
     uint32_t legacy_seq_last_ucblocks;
     struct timespec legacy_seq_last_time;
     int      legacy_seq_last_pct;
+
+    /* Background refresher for this stream's own live frontend stats —
+     * same fix as tuner.c's held_stats_thread (see its own comment in
+     * tuner.h), applied here too: dvb_frontend_read_stats() can itself
+     * block for multiple seconds on this hardware (confirmed live for
+     * the held-tuner case, up to 6.8s observed) — calling it directly
+     * from a connection thread answering a /tunerN/status GET while
+     * this stream is active risked exceeding a real client's own
+     * patience. Confirmed live (2026-08-28) this isn't just an
+     * occasional held-tuner risk: while actively streaming, the read
+     * consistently took just over a second on this hardware — every
+     * single status poll during playback, not a rare stall. Owns every
+     * read of frontend_fd's stats; dvb_stream_get_cached_stats() only
+     * ever reads the cache. Guarded by s->mtx, like the ring buffer
+     * fields above, except stats_thread itself (only ever touched by
+     * whichever code currently owns starting/joining it). */
+    pthread_t stats_thread;
+    bool      stats_thread_started;
+    volatile bool stats_stop_requested;
+    struct dvb_signal_stats stats_cache;
+    bool      stats_cache_valid;
 };
 
 static int open_pes_pid_filter(int adapter, int demux_num, uint16_t pid)
@@ -122,6 +143,7 @@ static int open_pes_pid_filter(int adapter, int demux_num, uint16_t pid)
         close(fd);
         return -1;
     }
+    fprintf(stderr, "[DEBUG] open_pes_pid_filter: opened demux fd=%d for pid=0x%04X on %s\n", fd, pid, path);
     return fd;
 }
 
@@ -151,6 +173,61 @@ static bool add_pid_if_new(struct dvb_stream *s, int adapter, int demux_num, uin
     return true;
 }
 
+/* How often stats_thread_main() refreshes this stream's cached signal
+ * stats. Same value/rationale as tuner.c's HELD_STATS_REFRESH_MS (see
+ * its own comment): short enough that /tunerN/status still looks live,
+ * comfortably longer than even the worst confirmed-live stat-read stall
+ * (6.8s) so this thread's own loop can't itself be a source of runaway
+ * ioctl spam. */
+#define STATS_REFRESH_MS 500
+
+/* Owns every read of frontend_fd's live signal stats while this stream
+ * is active — see stats_thread's own comment in the struct above. Runs
+ * until told to stop (stats_stop_requested set, or the stream is
+ * closing) — checked only *between* iterations, since
+ * dvb_frontend_read_stats() itself can't be interrupted once it's
+ * blocked inside a kernel ioctl on this hardware. Never closes
+ * frontend_fd itself; that stays dvb_stream_close()'s job, same as
+ * before this thread existed — this thread purely caches. */
+static void *stats_thread_main(void *arg)
+{
+    struct dvb_stream *s = (struct dvb_stream *)arg;
+
+    for (;;) {
+        struct dvb_signal_stats stats;
+        dvb_frontend_read_stats(s->frontend_fd, &stats); /* the call this
+            * whole thread exists to keep off any connection thread —
+            * see STATS_REFRESH_MS's own comment above. */
+        if (stats.symbol_quality_pct < 0) {
+            /* Modern DVBv5 block-count stats unavailable on this driver
+             * (confirmed: lgdt3306a) — fall back to the legacy
+             * FE_READ_UNCORRECTED_BLOCKS ioctl. Safe to call from this
+             * thread specifically because, once this thread exists, it's
+             * the sole owner of the legacy_seq_* fields too — no other
+             * caller reads live stats for an active stream anymore. */
+            int legacy = dvb_stream_get_legacy_seq_pct(s, stats.has_lock);
+            if (legacy >= 0) stats.symbol_quality_pct = legacy;
+        }
+
+        pthread_mutex_lock(&s->mtx);
+        if (s->stats_stop_requested || s->closing) {
+            pthread_mutex_unlock(&s->mtx);
+            break;
+        }
+        s->stats_cache = stats;
+        s->stats_cache_valid = true;
+        pthread_mutex_unlock(&s->mtx);
+
+        usleep(STATS_REFRESH_MS * 1000);
+
+        pthread_mutex_lock(&s->mtx);
+        bool stop = (s->stats_stop_requested || s->closing);
+        pthread_mutex_unlock(&s->mtx);
+        if (stop) break;
+    }
+    return NULL;
+}
+
 static void *reader_thread_main(void *arg)
 {
     struct dvb_stream *s = (struct dvb_stream *)arg;
@@ -164,6 +241,8 @@ static void *reader_thread_main(void *arg)
         ssize_t n = read(s->dvr_fd, chunk, sizeof(chunk));
         if (n <= 0) {
             if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+            fprintf(stderr, "[dvb_stream] reader_thread_main: read() failed, dvr_fd=%d, errno=%d %s\n",
+                s->dvr_fd, errno, strerror(errno));
             break; /* real error or EOF */
         }
 
@@ -337,6 +416,21 @@ struct dvb_stream *dvb_stream_open(int adapter, int frontend, int demux_num,
     clock_gettime(CLOCK_MONOTONIC, &s->start_time);
     s->window_start_time = s->start_time;
     s->window_start_bytes = 0;
+
+    /* Not fatal if this fails to start — /tunerN/status just falls back
+     * to the "still checking" placeholder (dvb_stream_get_cached_stats()
+     * returning false) instead of live stats, same degraded-but-safe
+     * behavior tuner.c's install_hold_fd() already accepts for the
+     * equivalent held-tuner case. */
+    if (pthread_create(&s->stats_thread, NULL, stats_thread_main, s) == 0) {
+        s->stats_thread_started = true;
+    } else {
+        fprintf(stderr, "dvb_stream: failed to start stats refresher thread -- "
+                         "/tunerN/status will show a placeholder instead of live "
+                         "stats for this stream\n");
+        s->stats_thread_started = false;
+    }
+
     return s;
 }
 
@@ -370,11 +464,19 @@ void dvb_stream_close(struct dvb_stream *s)
 
     pthread_mutex_lock(&s->mtx);
     s->closing = 1;
+    s->stats_stop_requested = true;
     pthread_cond_broadcast(&s->not_full);
     pthread_cond_broadcast(&s->not_empty);
     pthread_mutex_unlock(&s->mtx);
 
     pthread_join(s->thread, NULL);
+    /* Must finish before frontend_fd is closed below — same requirement
+     * as tuner.c's stop_held_stats_thread(), and the same tradeoff: can
+     * block briefly (up to however long stats_thread_main's current,
+     * possibly slow, stat-read takes), but this only ever runs at
+     * stream-teardown time, never on the /tunerN/status GET path itself,
+     * which is the entire point of this mechanism. */
+    if (s->stats_thread_started) pthread_join(s->stats_thread, NULL);
 
     close(s->dvr_fd);
     for (int i = 0; i < s->demux_fd_count; i++) close(s->demux_fds[i]);
@@ -386,9 +488,14 @@ void dvb_stream_close(struct dvb_stream *s)
     free(s);
 }
 
-int dvb_stream_frontend_fd(const struct dvb_stream *s)
+bool dvb_stream_get_cached_stats(struct dvb_stream *s, struct dvb_signal_stats *out)
 {
-    return s ? s->frontend_fd : -1;
+    if (!s) return false;
+    pthread_mutex_lock(&s->mtx);
+    bool valid = s->stats_cache_valid;
+    if (valid) *out = s->stats_cache;
+    pthread_mutex_unlock(&s->mtx);
+    return valid;
 }
 
 /* ATSC 8VSB segment rate, per ATSC A/53: symbol_rate (10,762,237 Hz,

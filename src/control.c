@@ -114,7 +114,10 @@
  *                      established scope as program itself; HTTP
  *                      passthrough always streams the plain named
  *                      channel regardless of either.
- *   /tunerN/target     "none" | "udp://ip:port" — drives udp_stream.c.
+ *   /tunerN/target     "none" | "ip:port" (an optional "udp://"/"rtp://"
+ *                      scheme prefix is also tolerated, but real clients
+ *                      - confirmed via real libhdhomerun source - never
+ *                      send one) — drives udp_stream.c.
  *                      A push abandoned by an uncleanly-terminated
  *                      client (crashed, killed, network dropped — never
  *                      sent target=none) is automatically reclaimed by
@@ -222,12 +225,24 @@ static int parse_tuner_path(const char *name, int max_tuners, const char **leaf)
 
 static int parse_udp_target(const char *value, char *ip_out, size_t ip_out_len, int *port_out)
 {
-    /* accepts "udp://ip:port" (and tolerates "rtp://" the same way, since
-     * we only implement the plain-UDP TS packing described in the
-     * project's README — no RTP header). */
+    /* Accepts a bare "ip:port" (the real, actual wire format a genuine
+     * libhdhomerun client sends for /tunerN/target — confirmed directly
+     * from real vendored libhdhomerun source, hdhomerun_device.c's
+     * hdhomerun_device_set_tuner_target_to_local: sprintf(target,
+     * "%u.%u.%u.%u:%u", ...), no scheme prefix at all), and still
+     * tolerates an optional "udp://"/"rtp://"-style scheme prefix if one
+     * is present (this project's own original assumption, harmless to
+     * keep accepting even though it turns out real hardware never sends
+     * one — we only implement the plain-UDP TS packing described in the
+     * project's README, no RTP header either way). Found via real
+     * end-to-end testing against TSReader-linux-port (github.com/
+     * TSReader/TSReader, linux-port branch): every /tunerN/target SET
+     * from its real, faithfully-ported libhdhomerun was being rejected
+     * here with "expected udp://ip:port", since it never sends one -
+     * this project's parser was the one asking for something no real
+     * client actually sends, not the reverse. */
     const char *p = strstr(value, "://");
-    if (!p) return -1;
-    p += 3;
+    p = p ? p + 3 : value;
     const char *colon = strrchr(p, ':');
     if (!colon) return -1;
 
@@ -402,32 +417,6 @@ static void compute_auto_filter(struct hdhr_tuner *t, char *out, size_t out_len)
     pid_filter_format(pids, count, out, out_len);
 }
 
-/* Temporary diagnostic (added 2026-07-20, remove once resolved):
- * investigating an intermittent "communication error" reported by real
- * hdhomerun_config `scan` runs. Leading theory: dvb_frontend_read_stats()
- * calls several DTV_STAT_* ioctls on this exact driver (lgdt3306a),
- * which is *already* documented elsewhere in this codebase (see
- * dvb_frontend.c's PROGRESS_CB_INTERVAL_MS comment) to occasionally
- * block for multiple seconds under marginal-signal conditions — that
- * finding was specific to the scan-progress path, which throttles how
- * often it calls in specifically to dodge this; a plain /tunerN/status
- * GET has no such throttle and calls it fresh on every single poll, on
- * the same connection thread that's supposed to reply fast. 800ms is
- * comfortably under libhdhomerun's own 2500ms GETSET recv timeout, so a
- * log here would mean a real client's own request very plausibly timed
- * out on this exact call. */
-#define SLOW_STAT_READ_WARN_MS 800
-
-static void log_if_slow(const char *label, int tuner_idx, const struct timespec *start)
-{
-    struct timespec end;
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    long ms = (end.tv_sec - start->tv_sec) * 1000L + (end.tv_nsec - start->tv_nsec) / 1000000L;
-    if (ms >= SLOW_STAT_READ_WARN_MS) {
-        fprintf(stderr, "control: tuner%d: %s took %ldms\n", tuner_idx, label, ms);
-    }
-}
-
 static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, const char *leaf)
 {
     char val[512];
@@ -457,21 +446,16 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
         if (t->lockkey) snprintf(val, sizeof(val), "0x%08X", t->lockkey);
         else snprintf(val, sizeof(val), "none");
     } else if (strcmp(leaf, "status") == 0) {
-        int ffd = t->active_stream ? dvb_stream_frontend_fd(t->active_stream) : -1;
-        if (ffd >= 0) {
-            struct dvb_signal_stats stats;
-            struct timespec t0;
-            clock_gettime(CLOCK_MONOTONIC, &t0);
-            dvb_frontend_read_stats(ffd, &stats);
-            log_if_slow("dvb_frontend_read_stats (active_stream)", t->index, &t0);
-            if (stats.symbol_quality_pct < 0) {
-                /* Modern DVBv5 block-count stats unavailable on this
-                 * driver (confirmed: lgdt3306a doesn't populate them at
-                 * all) — fall back to the legacy FE_READ_UNCORRECTED_BLOCKS
-                 * ioctl, windowed against the fixed ATSC segment rate. */
-                int legacy_pct = dvb_stream_get_legacy_seq_pct(t->active_stream, stats.has_lock);
-                if (legacy_pct >= 0) stats.symbol_quality_pct = legacy_pct;
-            }
+        struct dvb_signal_stats stats;
+        bool have_stats = t->active_stream && dvb_stream_get_cached_stats(t->active_stream, &stats);
+        if (have_stats) {
+            /* stats comes from dvb_stream's own background refresher now
+             * (see dvb_stream_get_cached_stats()'s own comment) — this
+             * connection thread never calls dvb_frontend_read_stats()
+             * directly anymore, so it can't block here regardless of how
+             * slow that ioctl is on this hardware. The legacy-seq
+             * fallback is folded into the cached reading too (computed by
+             * that same background thread), not recomputed here. */
             double bps = 0.0, pps = 0.0;
             dvb_stream_get_rate(t->active_stream, &bps, &pps);
             /* -1 ("no reading available at all") collapses to 0, same as
