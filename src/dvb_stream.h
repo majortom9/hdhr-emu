@@ -56,9 +56,12 @@ struct dvb_stream;
  * instead of failing outright.
  *
  * adopt_fd: -1 to open+tune+wait-for-lock a fresh frontend fd as usual;
- * >=0 to adopt an already-open frontend fd that's already tuned and
- * locked to `channel`'s mux (ownership transfers in either case — on
- * success dvb_stream owns it, on failure this function closes it).
+ * >=0 to adopt an already-open frontend fd (ownership transfers in
+ * either case — on success dvb_stream owns it, on failure this function
+ * closes it). If it's already tuned to `channel`'s mux (a held fd, or a
+ * parked one from the previous stream on the same mux) it's used as-is;
+ * otherwise (a parked fd left on a different mux — see tuner.h's
+ * parked_fd) it's retuned in place. Lock is confirmed either way.
  * This is tuner_try_claim()'s held-fd handoff (see tuner.h): closing an
  * already-locked hold just to reopen+relock the same frequency from
  * scratch a moment later isn't just wasteful, it can genuinely fail —
@@ -75,6 +78,14 @@ struct dvb_stream *dvb_stream_open(int adapter, int frontend, int demux_num,
 ssize_t dvb_stream_read(struct dvb_stream *s, void *buf, size_t len);
 
 void dvb_stream_close(struct dvb_stream *s);
+
+/* Same teardown as dvb_stream_close() (capture/stats threads, DVR and
+ * demux fds), except the frontend fd is left open -- still tuned, and
+ * still locked if it was -- and returned (ownership passes to the
+ * caller), or -1 if s is NULL. For tuner.c's parked_fd handoff, so the
+ * next stream on this tuner can adopt it (adopt_fd above) instead of
+ * paying a close/reopen. */
+int dvb_stream_close_keep_frontend(struct dvb_stream *s);
 
 /* Live signal stats for a caller (control.c's /tunerN/status) that wants
  * them while this stream is open — reads a cache kept fresh by a

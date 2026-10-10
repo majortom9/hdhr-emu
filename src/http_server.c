@@ -267,6 +267,76 @@ static void handle_lineup_json(int fd, const struct hdhr_config *cfg)
     free(body);
 }
 
+/* Ends an HTTP pull that got as far as tuner_bind_channel(): returns the
+ * tuner to idle ("ch=none") instead of letting tuner_release() re-open a
+ * background hold on the channel just watched. That hold (ARCHITECTURE.md
+ * §16) exists for a channel *selected* via the control protocol
+ * (vchannel/channel SET -- signal monitoring, antenna aiming); an HTTP
+ * pull's binding is only implicit, and real firmware frees an
+ * HTTP-streamed tuner once the stream ends. Confirmed live with mpv
+ * stepping through /lineup.m3u: it drops the old connection and requests
+ * the next channel within milliseconds, before this thread has noticed
+ * the disconnect, so /auto/ picks the *other* tuner -- and the first one
+ * then stayed held, locked, on the previous channel indefinitely, leaving
+ * both tuners engaged with only one viewer. Only clears the selection if
+ * it's still the one this stream bound -- a control-plane vchannel/
+ * channel SET that landed mid-stream is someone else's newer selection,
+ * left for tuner_release() to re-hold as usual. */
+static void release_http_pull(struct hdhr_tuner *t, const struct dvb_channel *ch)
+{
+    tuner_lock(t);
+    if (t->vch_resolved && t->vch_major == ch->major && t->vch_minor == ch->minor &&
+        t->tuned_frequency_hz == ch->frequency_hz) {
+        snprintf(t->channel, sizeof(t->channel), "none");
+        t->tuned_frequency_hz = 0;
+        t->vch_resolved = false;
+        t->program = DVB_PROGRAM_DEFAULT;
+        t->filter_override[0] = '\0';
+        /* Same idle string as tuner_pool_init()/channel=none -- see the
+         * former's comment for why the "ch=" token matters. */
+        snprintf(t->status, sizeof(t->status), "ch=none lock=none ss=0 snq=0 seq=0 bps=0 pps=0");
+    }
+    tuner_unlock(t);
+    tuner_release_park(t); /* closes the stream but parks its frontend -- see tuner.h parked_fd */
+}
+
+/* How long a /auto/ request waits for a tuner still streaming to the
+ * same client before giving up and taking any free tuner. Has to cover
+ * the old stream's whole teardown: noticing the disconnect (next write()
+ * fails, typically milliseconds), then dvb_stream_close() joining its
+ * reader and stats threads -- the stats thread can be mid-way through
+ * a frontend stat read that takes ~1s while streaming on this hardware,
+ * plus its 500ms refresh sleep. Only ever spent in full when that
+ * client genuinely has a second stream still open (e.g. two player
+ * windows on one machine), which then falls back to another tuner as
+ * before. */
+#define AUTO_AFFINITY_WAIT_MS 3000
+
+/* /auto/ client affinity -- see http_peer_addr in tuner.h. If some
+ * tuner is still streaming to this same client address, waits (up to
+ * AUTO_AFFINITY_WAIT_MS) to take that tuner over once its old stream
+ * ends, so a player changing channels keeps using one tuner instead of
+ * alternating between them. Returns NULL if there's no such tuner or
+ * the wait times out; the caller then falls back to
+ * tuner_pool_claim_free(). */
+static struct hdhr_tuner *claim_for_peer(struct hdhr_tuner *tuners, int count, uint32_t peer_addr,
+                                          const struct dvb_channel *ch, int *out_reused_fd)
+{
+    if (peer_addr == 0) return NULL;
+    for (int i = 0; i < count; i++) {
+        struct hdhr_tuner *t = &tuners[i];
+        tuner_lock(t);
+        bool mine = t->busy && t->http_peer_addr == peer_addr;
+        tuner_unlock(t);
+        if (!mine) continue;
+        if (tuner_try_claim_wait(t, AUTO_AFFINITY_WAIT_MS, ch->frequency_hz, ch->delivery, out_reused_fd)) {
+            return t;
+        }
+        return NULL; /* that client's other stream is still live -- use any free tuner */
+    }
+    return NULL;
+}
+
 /* requested_tuner_idx: -1 to auto-allocate any free tuner (the plain
  * /auto/vX.X path); >=0 to require that specific tuner slot (the
  * /tunerN/vX.X path, e.g. hdhomerun_config's "save /tunerN -"). */
@@ -280,6 +350,11 @@ static void stream_channel_to_client(int fd, const struct hdhr_config *cfg,
         return;
     }
 
+    struct sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+    uint32_t peer_addr = (getpeername(fd, (struct sockaddr *)&peer, &peer_len) == 0)
+                         ? peer.sin_addr.s_addr : 0;
+
     int reused_fd = -1;
     struct hdhr_tuner *t;
     if (requested_tuner_idx >= 0) {
@@ -289,12 +364,16 @@ static void stream_channel_to_client(int fd, const struct hdhr_config *cfg,
             return;
         }
     } else {
-        t = tuner_pool_claim_free(tuners, cfg->tuner_count, ch->frequency_hz, ch->delivery, &reused_fd);
+        t = claim_for_peer(tuners, cfg->tuner_count, peer_addr, ch, &reused_fd);
+        if (!t) t = tuner_pool_claim_free(tuners, cfg->tuner_count, ch->frequency_hz, ch->delivery, &reused_fd);
         if (!t) {
             send_503(fd, "all tuners busy\n");
             return;
         }
     }
+    tuner_lock(t);
+    t->http_peer_addr = peer_addr; /* cleared by tuner_release() */
+    tuner_unlock(t);
 
     /* HTTP passthrough doesn't consult t->program or t->filter_override,
      * same established asymmetry as program (see tuner.h) — this path
@@ -314,7 +393,7 @@ static void stream_channel_to_client(int fd, const struct hdhr_config *cfg,
     int hn = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\nContent-Type: video/mpeg\r\n"
         "Connection: close\r\nServer: hdhr-emu\r\n\r\n");
-    if (write(fd, hdr, (size_t)hn) < 0) { tuner_release(t); return; }
+    if (write(fd, hdr, (size_t)hn) < 0) { release_http_pull(t, ch); return; }
 
     uint8_t buf[188 * 64];
     for (;;) {
@@ -328,7 +407,7 @@ static void stream_channel_to_client(int fd, const struct hdhr_config *cfg,
         }
     }
 out:
-    tuner_release(t); /* closes ds internally */
+    release_http_pull(t, ch); /* closes ds internally */
 }
 
 /* Only the web UI's /api/tuner<N>/channel route (web_ui.c) accepts

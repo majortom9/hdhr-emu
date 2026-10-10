@@ -197,6 +197,37 @@ struct hdhr_tuner {
     bool     busy;
     struct dvb_stream *active_stream;
 
+    /* Client IPv4 address (network byte order) of the HTTP pull
+     * currently streaming from this tuner, 0 if none -- set/cleared by
+     * http_server.c's stream_channel_to_client()/release_http_pull().
+     * Lets a /auto/ request from the same client prefer this tuner,
+     * briefly waiting for it to free up, instead of grabbing a
+     * different one: a player stepping through a playlist (confirmed
+     * with mpv) requests the next channel within milliseconds of
+     * dropping the old connection, before the server has noticed the
+     * disconnect and released. Guarded by `lock`. */
+    uint32_t http_peer_addr;
+
+    /* A finished HTTP pull's frontend fd, still open and tuned (and
+     * normally still locked) to whatever it was streaming, -1 if none --
+     * set by tuner_release_park(), see its comment. Unlike held_fd this
+     * is NOT a channel selection: /tunerN/status reports the tuner idle
+     * ("ch=none"), nothing reads stats from it, and it's closed for good
+     * after TUNER_PARK_MS (tuner.c) unless a claim takes it first. Exists
+     * because the next stream after a channel change otherwise had to
+     * close and immediately reopen the same frontend -- on this driver a
+     * full chip re-init plus a relock that could miss dvb_stream.c's
+     * LOCK_TIMEOUT_MS outright (confirmed live: mpv stepping through
+     * /lineup.m3u got 502s and ~20s stalls). Every claim function and
+     * tuner_open_hold() takes it: handed to the claimer as its reused fd
+     * if the claimer asked for one (dvb_stream_open() then retunes it in
+     * place if the new channel is on a different mux), closed otherwise,
+     * so a frontend is never opened twice. Guarded by `lock`;
+     * park_generation lets the expiry timer tell its own park from a
+     * later one. */
+    int      parked_fd;
+    uint32_t park_generation;
+
     /* True only while control.c's channel_scan_thread_main actually owns
      * this tuner's claim -- distinct from `busy`, which also goes true
      * for claims nothing drains a queue for (main.c's one-shot startup
@@ -494,6 +525,16 @@ void tuner_set_stream(struct hdhr_tuner *t, struct dvb_stream *s);
  * channel/vchannel SET -- matching real hardware, which never stops
  * engaging a selected tuner's frontend just because a viewer left. */
 void tuner_release(struct hdhr_tuner *t);
+
+/* tuner_release() for a finished HTTP pull whose selection the caller
+ * has already cleared (http_server.c's release_http_pull()): tears the
+ * stream down but keeps its frontend fd open as parked_fd (see its
+ * comment) for TUNER_PARK_MS, so the next channel -- typically
+ * requested by the same player within milliseconds -- starts without a
+ * close/reopen. Falls back to plain tuner_release() behavior if a
+ * channel is still selected (a control-plane SET landed mid-stream, so
+ * the frontend belongs to that selection's hold instead). */
+void tuner_release_park(struct hdhr_tuner *t);
 
 /* Records which virtual channel + effective program an active stream is
  * actually serving, so /tunerN/status, /tunerN/vchannel, and

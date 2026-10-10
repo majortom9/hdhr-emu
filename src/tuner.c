@@ -18,6 +18,7 @@
 
 #include "tuner.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <time.h>
@@ -31,6 +32,7 @@ void tuner_pool_init(struct hdhr_tuner *tuners, int count, const struct hdhr_con
         tuners[i].adapter = cfg->dvb_adapter[i];
         tuners[i].frontend = cfg->dvb_frontend;
         tuners[i].held_fd = -1;
+        tuners[i].parked_fd = -1;
         pthread_mutex_init(&tuners[i].lock, NULL);
         pthread_cond_init(&tuners[i].free_cond, NULL);
         pthread_cond_init(&tuners[i].pending_cond, NULL);
@@ -168,6 +170,22 @@ static void resolve_claimed_hold(struct hdhr_tuner *t, int held, uint32_t tuned_
                                 * concurrent with an active_stream's fd */
 }
 
+/* Second half of a claim, for parked_fd (see tuner.h) -- `parked` was
+ * already detached from the tuner under the lock. Hands it to the
+ * claimer as its reused fd if it asked for one and resolve_claimed_hold()
+ * didn't already give it a held fd (dvb_stream_open() retunes it if
+ * needed); otherwise closes it, so the claimer's own frontend open can't
+ * collide with it. */
+static void resolve_claimed_parked(int parked, int *out_reused_fd)
+{
+    if (parked < 0) return;
+    if (out_reused_fd && *out_reused_fd < 0) {
+        *out_reused_fd = parked;
+        return;
+    }
+    dvb_frontend_close(parked);
+}
+
 bool tuner_try_claim(struct hdhr_tuner *t, uint32_t want_freq_hz,
                       enum hdhr_delivery_system want_delivery, int *out_reused_fd)
 {
@@ -179,11 +197,14 @@ bool tuner_try_claim(struct hdhr_tuner *t, uint32_t want_freq_hz,
     t->busy = true;
     int held = t->held_fd;
     t->held_fd = -1;
+    int parked = t->parked_fd;
+    t->parked_fd = -1;
     uint32_t tuned_freq_hz = t->tuned_frequency_hz;
     enum hdhr_delivery_system tuned_delivery = t->tuned_delivery;
     tuner_unlock(t);
 
     resolve_claimed_hold(t, held, tuned_freq_hz, tuned_delivery, want_freq_hz, want_delivery, out_reused_fd);
+    resolve_claimed_parked(parked, out_reused_fd);
     return true;
 }
 
@@ -197,6 +218,13 @@ bool tuner_try_claim_fast(struct hdhr_tuner *t, int *out_stale_held_fd)
     t->busy = true;
     *out_stale_held_fd = t->held_fd;
     t->held_fd = -1;
+    /* A parked fd (see tuner.h) goes the same deferred-close route -- this
+     * caller (control.c's channel scan) opens its own frontend, so it
+     * just has to be closed first, and tuner_resolve_stale_held_fd() does
+     * exactly that off the connection thread. held_fd and parked_fd are
+     * never both open (one frontend, one opener). */
+    if (*out_stale_held_fd < 0) *out_stale_held_fd = t->parked_fd;
+    t->parked_fd = -1;
     tuner_unlock(t);
     return true;
 }
@@ -243,11 +271,14 @@ bool tuner_try_claim_wait(struct hdhr_tuner *t, int timeout_ms, uint32_t want_fr
     t->busy = true;
     int held = t->held_fd;
     t->held_fd = -1;
+    int parked = t->parked_fd;
+    t->parked_fd = -1;
     uint32_t tuned_freq_hz = t->tuned_frequency_hz;
     enum hdhr_delivery_system tuned_delivery = t->tuned_delivery;
     tuner_unlock(t);
 
     resolve_claimed_hold(t, held, tuned_freq_hz, tuned_delivery, want_freq_hz, want_delivery, out_reused_fd);
+    resolve_claimed_parked(parked, out_reused_fd);
     return true;
 }
 
@@ -263,14 +294,31 @@ void tuner_release(struct hdhr_tuner *t)
     tuner_lock(t);
     struct dvb_stream *s = t->active_stream;
     t->active_stream = NULL;
+    tuner_unlock(t);
+
+    if (s) dvb_stream_close(s); /* close outside the lock — it blocks on thread join */
+
+    /* busy is cleared only once the stream (and its frontend fd) is
+     * fully closed -- it used to be cleared before dvb_stream_close(),
+     * which let a tuner_try_claim_wait() waiter claim the tuner and call
+     * dvb_frontend_open() while the old stream's fd on the same frontend
+     * node was still open (a frontend accepts one read/write opener at a
+     * time), failing the new stream outright. Matters now that /auto/
+     * pulls deliberately wait on a just-released tuner (see
+     * http_peer_addr in tuner.h). */
+    tuner_lock(t);
     t->busy = false;
+    /* Cleared here, atomically with busy, rather than by http_server.c
+     * before calling us: a same-client /auto/ request arriving *during*
+     * the close above must still see this tuner as "theirs" and wait
+     * for it (see http_peer_addr in tuner.h), and clearing it after this
+     * point could wipe the address a new claimer just recorded. */
+    t->http_peer_addr = 0;
     uint32_t freq = t->tuned_frequency_hz;
     enum hdhr_delivery_system delivery = t->tuned_delivery;
     bool already_held = (t->held_fd >= 0);
     pthread_cond_signal(&t->free_cond); /* wake anyone in tuner_try_claim_wait() */
     tuner_unlock(t);
-
-    if (s) dvb_stream_close(s); /* close outside the lock — it blocks on thread join */
 
     /* Re-establish a background hold so /tunerN/status keeps reporting
      * genuinely live stats even after streaming stops, matching real
@@ -282,6 +330,96 @@ void tuner_release(struct hdhr_tuner *t)
      * while this stream was still winding down). */
     if (freq != 0 && !already_held) {
         tuner_open_hold(t, freq, delivery);
+    }
+}
+
+/* How long a finished HTTP pull's frontend stays parked (see parked_fd
+ * in tuner.h) waiting for the next stream. A player changing channels
+ * reconnects within milliseconds; this only needs to comfortably cover
+ * that plus http_server.c's AUTO_AFFINITY_WAIT_MS handoff. After it
+ * expires the frontend is genuinely closed, same end state as before
+ * parking existed. */
+#define TUNER_PARK_MS 5000
+
+struct park_expiry_ctx {
+    struct hdhr_tuner *t;
+    uint32_t generation;
+};
+
+static void *park_expiry_thread_main(void *arg)
+{
+    struct park_expiry_ctx *ctx = arg;
+    usleep(TUNER_PARK_MS * 1000);
+
+    struct hdhr_tuner *t = ctx->t;
+    tuner_lock(t);
+    int fd = -1;
+    if (t->park_generation == ctx->generation) { /* still this park, not a later one */
+        fd = t->parked_fd;
+        t->parked_fd = -1;
+    }
+    tuner_unlock(t);
+    if (fd >= 0) dvb_frontend_close(fd);
+    free(ctx);
+    return NULL;
+}
+
+void tuner_release_park(struct hdhr_tuner *t)
+{
+    tuner_lock(t);
+    struct dvb_stream *s = t->active_stream;
+    t->active_stream = NULL;
+    bool selected = (t->tuned_frequency_hz != 0);
+    tuner_unlock(t);
+
+    if (!s || selected) {
+        /* Nothing to park, or the frontend now belongs to a control-plane
+         * selection made mid-stream (see tuner.h) -- tuner_release() closes
+         * the stream and re-holds that selection exactly as before. */
+        tuner_lock(t);
+        t->active_stream = s;
+        tuner_unlock(t);
+        tuner_release(t);
+        return;
+    }
+
+    int fd = dvb_stream_close_keep_frontend(s); /* blocks on thread joins, outside the lock */
+
+    struct park_expiry_ctx *ctx = (fd >= 0) ? malloc(sizeof(*ctx)) : NULL;
+
+    /* Parked fd installed *before* busy clears, under the same lock, so a
+     * claimer woken by free_cond below always finds it -- never a window
+     * where the tuner looks free but its frontend is still open with no
+     * one accounting for it. */
+    tuner_lock(t);
+    if (ctx) {
+        t->parked_fd = fd;
+        ctx->t = t;
+        ctx->generation = ++t->park_generation;
+    }
+    t->busy = false;
+    t->http_peer_addr = 0; /* see tuner_release()'s identical line */
+    pthread_cond_signal(&t->free_cond);
+    tuner_unlock(t);
+
+    if (fd >= 0 && !ctx) {
+        dvb_frontend_close(fd); /* malloc failed: just don't park */
+        return;
+    }
+    if (ctx) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, park_expiry_thread_main, ctx) == 0) {
+            pthread_detach(th);
+        } else {
+            /* No timer to expire it -- close now rather than leak an open
+             * frontend indefinitely (unless a claimer already took it). */
+            tuner_lock(t);
+            int still = (t->park_generation == ctx->generation) ? t->parked_fd : -1;
+            if (still >= 0) t->parked_fd = -1;
+            tuner_unlock(t);
+            if (still >= 0) dvb_frontend_close(still);
+            free(ctx);
+        }
     }
 }
 
@@ -308,11 +446,14 @@ static bool close_existing_hold_for_new_one(struct hdhr_tuner *t)
     }
     int old_held = t->held_fd;
     t->held_fd = -1;
+    int parked = t->parked_fd; /* see tuner.h -- must be closed before a new open too */
+    t->parked_fd = -1;
     tuner_unlock(t);
     if (old_held >= 0) {
         stop_held_stats_thread(t); /* must finish before old_held is closed */
         dvb_frontend_close(old_held);
     }
+    if (parked >= 0) dvb_frontend_close(parked);
     return true;
 }
 

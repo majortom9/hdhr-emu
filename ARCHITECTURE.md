@@ -777,6 +777,41 @@ waste. `channelmap` SET and an explicit `channel=none` both call
 `tuner_close_hold()` directly, since either invalidates whatever was
 held.
 
+**An HTTP pull is not a selection.** `http_server.c`'s
+`release_http_pull()` clears the binding an HTTP stream made (back to
+`ch=none`) before `tuner_release()`, so no hold is re-opened afterward —
+matching real firmware, which frees an HTTP-streamed tuner when the
+stream ends. Found live with mpv stepping through `/lineup.m3u`: it
+requests the next channel within milliseconds of dropping the old
+connection, before the server has noticed the disconnect, so `/auto/`
+lands on the other tuner — and the first then stayed held on the
+previous channel indefinitely, leaving both tuners engaged for one
+viewer. A control-plane `vchannel`/`channel` SET that arrives mid-stream
+is left alone (it's a genuine selection, and gets re-held as usual).
+
+Two follow-ups make channel changes through `/auto/` fast and
+single-tuner:
+
+- **Client affinity** (`http_peer_addr`, `claim_for_peer()`): a new
+  `/auto/` request from a client address that a tuner is still
+  streaming to waits up to `AUTO_AFFINITY_WAIT_MS` (3s) to take that
+  tuner over, instead of grabbing a different one. A client with a
+  genuinely concurrent second stream times out and falls back to any
+  free tuner. This required `tuner_release()` to clear `busy` only
+  *after* `dvb_stream_close()` — it used to clear it first, letting a
+  waiter open the frontend while the old fd was still open.
+- **Parked frontend** (`parked_fd`, `tuner_release_park()`): the
+  finished stream's frontend fd is kept open, tuned and locked, for
+  `TUNER_PARK_MS` (5s) rather than closed. The next claim adopts it
+  (`dvb_stream_open()`'s `adopt_fd`): same mux → no tune at all;
+  different mux → retuned in place. Without this, every channel change
+  was a close-then-reopen of the same frontend — a full chip re-init
+  and a relock that, confirmed live, missed `LOCK_TIMEOUT_MS` often
+  enough to 502 and leave mpv stalled ~20s. A parked fd is not a
+  selection: status reads idle, no stats are read from it, and every
+  claim path or `tuner_open_hold()` takes it (reuse or close) so the
+  frontend is never opened twice.
+
 ## 17. Debugging techniques that worked, worth reusing
 
 - **`/proc/<pid>/task/*/stat` sampling** (`ps -eLo tid,stat,wchan,comm`,

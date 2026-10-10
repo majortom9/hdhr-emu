@@ -147,17 +147,15 @@ static int open_pes_pid_filter(int adapter, int demux_num, uint16_t pid)
     return fd;
 }
 
-/* Adds a PID filter unless it's 0 (meaning "not applicable", e.g. no
- * audio found) or a duplicate of one already opened — PCR very commonly
+/* Adds a PID filter unless it's a duplicate of one already opened — PCR very commonly
  * shares the video PID on ATSC broadcasts, and opening two separate PES
  * filters on the same PID genuinely duplicates every packet on that PID
  * into the shared DVR device (each filter independently matches and
  * emits it), not just a cosmetic double-count — this corrupts the
  * resulting elementary stream (a decoder sees interleaved duplicate PES
  * packets) in addition to inflating the measured bitrate. */
-static bool add_pid_if_new(struct dvb_stream *s, int adapter, int demux_num, uint16_t pid)
+static bool add_pid(struct dvb_stream *s, int adapter, int demux_num, uint16_t pid)
 {
-    if (pid == 0) return true;
     for (int i = 0; i < s->demux_fd_count; i++) {
         if (s->demux_pids[i] == pid) return true; /* already filtering this PID — nothing to do */
     }
@@ -171,6 +169,23 @@ static bool add_pid_if_new(struct dvb_stream *s, int adapter, int demux_num, uin
     s->demux_fds[s->demux_fd_count] = fd;
     s->demux_fd_count++;
     return true;
+}
+
+/* add_pid() for a PID taken from a dvb_channel field, where 0 means "not
+ * applicable" (e.g. no audio stream found) rather than a real PID.
+ * PAT's genuine PID 0x0000 must go through add_pid() directly instead --
+ * an earlier version had this zero check inside the one shared helper,
+ * which silently dropped PAT from every program-filtered stream (it was
+ * only ever present in full-mux passthrough). Players then couldn't find
+ * the PMT and fell back to blind probing: ffmpeg/mpv read their whole
+ * 5MB probesize before starting, ~5s on an HD channel and 20-30s on a
+ * ~1.3Mbps SD subchannel -- confirmed live by capturing /auto/v2.2 (no
+ * PID 0x0000 packets at all) and ffprobe's "bytes read:5013504
+ * nb_streams:0" before stream discovery. */
+static bool add_pid_if_new(struct dvb_stream *s, int adapter, int demux_num, uint16_t pid)
+{
+    if (pid == 0) return true;
+    return add_pid(s, adapter, demux_num, pid);
 }
 
 /* How often stats_thread_main() refreshes this stream's cached signal
@@ -288,34 +303,44 @@ struct dvb_stream *dvb_stream_open(int adapter, int frontend, int demux_num,
     pthread_cond_init(&s->not_empty, NULL);
     pthread_cond_init(&s->not_full, NULL);
 
-    if (adopt_fd >= 0) {
-        /* Already open, tuned, and locked — see this function's own
-         * comment in dvb_stream.h for why the caller hands us this
-         * instead of a fresh fd to open ourselves. */
+    /* An adopted fd (see this function's own comment in dvb_stream.h) is
+     * already open, and -- for a held or parked fd on this same mux --
+     * already tuned and locked, so neither the open nor the tune is
+     * repeated. One on a *different* frequency (a parked fd from the
+     * previous channel, see tuner.h's parked_fd) is retuned in place:
+     * still no close/reopen, which on this driver means a full chip
+     * re-init and a relock that can miss LOCK_TIMEOUT_MS outright. */
+    bool adopted = (adopt_fd >= 0);
+    bool qam = (channel->delivery == HDHR_DELIVERY_QAM);
+    if (adopted) {
         s->frontend_fd = adopt_fd;
     } else {
         s->frontend_fd = dvb_frontend_open(adapter, frontend);
         if (s->frontend_fd < 0) { free(s); return NULL; }
+    }
 
+    if (!adopted || !dvb_frontend_is_tuned_to(s->frontend_fd, channel->frequency_hz, qam)) {
         /* channel->delivery (stamped at scan time — see dvb_scan.c) tells
          * us which tune function this mux actually needs; a stream open
          * only gets the dvb_channel pointer, not whatever channelmap was
          * active when it was originally scanned. */
-        int tune_rc = (channel->delivery == HDHR_DELIVERY_QAM)
-                      ? dvb_frontend_tune_qam(s->frontend_fd, channel->frequency_hz)
-                      : dvb_frontend_tune_8vsb(s->frontend_fd, channel->frequency_hz);
+        int tune_rc = qam ? dvb_frontend_tune_qam(s->frontend_fd, channel->frequency_hz)
+                          : dvb_frontend_tune_8vsb(s->frontend_fd, channel->frequency_hz);
         if (tune_rc != 0) {
             dvb_frontend_close(s->frontend_fd);
             free(s);
             return NULL;
         }
-        if (!dvb_frontend_wait_lock(s->frontend_fd, LOCK_TIMEOUT_MS, NULL, NULL)) {
-            fprintf(stderr, "dvb_stream: no lock on %u Hz for %d.%d\n",
-                    channel->frequency_hz, channel->major, channel->minor);
-            dvb_frontend_close(s->frontend_fd);
-            free(s);
-            return NULL;
-        }
+    }
+    /* Returns on its first status read if already locked (the common
+     * adopted case), so this costs nothing there. */
+    if (!dvb_frontend_wait_lock(s->frontend_fd, LOCK_TIMEOUT_MS, NULL, NULL)) {
+        fprintf(stderr, "dvb_stream: no lock on %u Hz for %d.%d%s\n",
+                channel->frequency_hz, channel->major, channel->minor,
+                adopted ? " (adopted frontend fd)" : "");
+        dvb_frontend_close(s->frontend_fd);
+        free(s);
+        return NULL;
     }
 
     bool ok = true;
@@ -331,7 +356,7 @@ struct dvb_stream *dvb_stream_open(int adapter, int frontend, int demux_num,
          * lower-level override. */
         fprintf(stderr, "dvb_stream: %d.%d: explicit PID filter (%d PIDs)\n",
                 channel->major, channel->minor, pid_filter_total_count(&pf));
-        ok = add_pid_if_new(s, adapter, demux_num, 0x0000); /* PAT, same as the program path below */
+        ok = add_pid(s, adapter, demux_num, 0x0000); /* PAT, same as the program path below */
         for (int i = 0; i < pf.count && ok; i++) {
             for (uint32_t pid = pf.ranges[i].start; pid <= pf.ranges[i].end && ok; pid++) {
                 ok = add_pid_if_new(s, adapter, demux_num, (uint16_t)pid);
@@ -380,7 +405,7 @@ struct dvb_stream *dvb_stream_open(int adapter, int frontend, int demux_num,
          * earlier version of this code opened a second real filter on
          * the same PID in that case, duplicating packets rather than
          * harmlessly merging them. */
-        ok = ok && add_pid_if_new(s, adapter, demux_num, 0x0000); /* PAT */
+        ok = ok && add_pid(s, adapter, demux_num, 0x0000); /* PAT -- add_pid(), not _if_new: see the latter's comment */
         ok = ok && add_pid_if_new(s, adapter, demux_num, target->pmt_pid);
         ok = ok && add_pid_if_new(s, adapter, demux_num, target->pcr_pid);
         ok = ok && add_pid_if_new(s, adapter, demux_num, target->video_pid);
@@ -458,9 +483,9 @@ ssize_t dvb_stream_read(struct dvb_stream *s, void *buf, size_t len)
     return (ssize_t)chunk_len;
 }
 
-void dvb_stream_close(struct dvb_stream *s)
+/* Shared by dvb_stream_close()/dvb_stream_close_keep_frontend(). */
+static int stream_teardown(struct dvb_stream *s, bool keep_frontend)
 {
-    if (!s) return;
 
     pthread_mutex_lock(&s->mtx);
     s->closing = 1;
@@ -480,12 +505,29 @@ void dvb_stream_close(struct dvb_stream *s)
 
     close(s->dvr_fd);
     for (int i = 0; i < s->demux_fd_count; i++) close(s->demux_fds[i]);
-    dvb_frontend_close(s->frontend_fd);
+    int ffd = s->frontend_fd;
+    if (!keep_frontend) {
+        dvb_frontend_close(ffd);
+        ffd = -1;
+    }
 
     pthread_mutex_destroy(&s->mtx);
     pthread_cond_destroy(&s->not_empty);
     pthread_cond_destroy(&s->not_full);
     free(s);
+    return ffd;
+}
+
+void dvb_stream_close(struct dvb_stream *s)
+{
+    if (!s) return;
+    stream_teardown(s, false);
+}
+
+int dvb_stream_close_keep_frontend(struct dvb_stream *s)
+{
+    if (!s) return -1;
+    return stream_teardown(s, true);
 }
 
 bool dvb_stream_get_cached_stats(struct dvb_stream *s, struct dvb_signal_stats *out)

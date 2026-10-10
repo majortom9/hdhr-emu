@@ -165,6 +165,18 @@ int dvb_frontend_tune_qam(int fd, uint32_t frequency_hz)
     return 0;
 }
 
+bool dvb_frontend_is_tuned_to(int fd, uint32_t freq_hz, bool qam)
+{
+    struct dtv_property props[2];
+    memset(props, 0, sizeof(props));
+    props[0].cmd = DTV_FREQUENCY;
+    props[1].cmd = DTV_DELIVERY_SYSTEM;
+    struct dtv_properties req = { .num = 2, .props = props };
+    if (ioctl(fd, FE_GET_PROPERTY, &req) < 0) return false;
+    return props[0].u.data == freq_hz &&
+           props[1].u.data == (uint32_t)(qam ? SYS_DVBC_ANNEX_B : SYS_ATSC);
+}
+
 /* How often the (potentially expensive) progress callback actually
  * fires, vs. how often we poll FE_READ_STATUS (step_ms). Calling it on
  * every single poll tick turned out to be a real problem: the callback

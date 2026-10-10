@@ -61,6 +61,14 @@ int dvb_frontend_tune_8vsb(int fd, uint32_t frequency_hz);
  * dvb_frontend.c. */
 int dvb_frontend_tune_qam(int fd, uint32_t frequency_hz);
 
+/* True if fd's last-committed tune (the kernel's DTV_FREQUENCY/
+ * DTV_DELIVERY_SYSTEM property cache, read back via FE_GET_PROPERTY --
+ * no hardware access) is freq_hz on the delivery system `qam` selects
+ * (SYS_DVBC_ANNEX_B if true, else SYS_ATSC). Lets a caller adopting an
+ * already-open frontend fd (dvb_stream_open()'s adopt_fd) skip a retune
+ * it doesn't need. Says nothing about lock -- check that separately. */
+bool dvb_frontend_is_tuned_to(int fd, uint32_t freq_hz, bool qam);
+
 /* Called once per poll iteration inside dvb_frontend_wait_lock(), from
  * the SAME thread that owns fd (never a different thread) — see that
  * function's own comment for why this matters. */
