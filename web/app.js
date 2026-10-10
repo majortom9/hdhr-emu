@@ -84,6 +84,23 @@ function setBar(card, cls, pct) {
   card.querySelector('.' + cls + '-pct').textContent = pct + '%';
 }
 
+/* The raw DVB-API reading behind a bar's percentage (signal_dbm/snr_db
+ * from /api/tuners.json, ultimately /tunerN/debug's ss_dbm=/snr_db=) --
+ * null means the driver didn't report it (CNR commonly isn't available
+ * without lock): shown as a dash while a channel is tuned, blank when
+ * the tuner is idle, so an idle card doesn't look like a failed read. */
+function setRaw(card, cls, value, unit, tuned) {
+  const el = card.querySelector('.' + cls + '-raw');
+  if (value !== null && value !== undefined) el.textContent = `${value.toFixed(1)} ${unit}`;
+  else el.textContent = tuned ? `— ${unit}` : '';
+}
+
+function renderRaw(card, t) {
+  const tuned = !!t.physical_channel && t.physical_channel !== 'none';
+  setRaw(card, 'ss', t.signal_dbm, 'dBm', tuned);
+  setRaw(card, 'snq', t.snr_db, 'dB', tuned);
+}
+
 function renderFound(el, streaminfo) {
   if (!streaminfo || !streaminfo.length) { el.innerHTML = ''; return; }
   el.innerHTML = streaminfo.map(c =>
@@ -101,6 +118,7 @@ function renderTuner(t) {
   setBar(card, 'ss', t.signal_strength_pct);
   setBar(card, 'snq', t.signal_quality_pct);
   setBar(card, 'seq', t.symbol_quality_pct);
+  renderRaw(card, t);
 
   card.querySelector('.rate').textContent = (t.bps > 0) ? `${(t.bps / 1e6).toFixed(2)} Mbps` : '';
 
@@ -240,6 +258,7 @@ async function onScanStart(idx) {
       setBar(card, 'ss', result.signal_strength_pct);
       setBar(card, 'snq', result.signal_quality_pct);
       setBar(card, 'seq', result.symbol_quality_pct);
+      renderRaw(card, result);
     } catch (e) { /* one bad channel shouldn't abort the whole scan */ }
   }
 
@@ -350,6 +369,13 @@ document.getElementById('lineup').addEventListener('click', (e) => {
 });
 
 document.getElementById('lineup-refresh').addEventListener('click', loadLineup);
+/* Built server-side (http_server.c's handle_lineup_m3u) from the live
+ * channel db, so it always matches what /lineup.json would report right
+ * now. Served with Content-Disposition: attachment, so navigating to it
+ * downloads the file and leaves this page in place. */
+document.getElementById('lineup-export').addEventListener('click', () => {
+  window.location.href = '/lineup.m3u';
+});
 
 loadDeviceInfo();
 loadLineup();

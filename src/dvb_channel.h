@@ -67,6 +67,14 @@ int dvb_channel_count(void);
 const struct dvb_channel *dvb_channel_at(int i);
 const struct dvb_channel *dvb_find_channel(int major, int minor);
 
+/* Copies the whole channel db into out[] (by value, taken under the db
+ * lock -- a consistent snapshot, unlike walking dvb_channel_at()),
+ * sorted by major then minor ascending, numerically (9.1 before 10.1).
+ * Used for lineup.json/lineup.m3u, whose order clients typically
+ * preserve as their channel list; the db's own order is just scan/
+ * cache insertion order. Returns the count written (capped at max_out). */
+int dvb_channels_sorted(struct dvb_channel *out, int max_out);
+
 /* Fills out[] with every channel sharing the given mux frequency (used to
  * resolve a /tunerN/program override to a sibling subchannel's PIDs
  * without a fresh scan). Returns the count written (capped at max_out). */

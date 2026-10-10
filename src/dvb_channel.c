@@ -19,6 +19,7 @@
 #include "dvb_channel.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <pthread.h>
 
 static struct dvb_channel g_channels[DVB_CHANNEL_MAX];
@@ -81,6 +82,25 @@ const struct dvb_channel *dvb_find_channel(int major, int minor)
     }
     pthread_mutex_unlock(&g_lock);
     return NULL;
+}
+
+static int cmp_major_minor(const void *a, const void *b)
+{
+    const struct dvb_channel *x = a, *y = b;
+    if (x->major != y->major) return (x->major < y->major) ? -1 : 1;
+    if (x->minor != y->minor) return (x->minor < y->minor) ? -1 : 1;
+    return 0;
+}
+
+int dvb_channels_sorted(struct dvb_channel *out, int max_out)
+{
+    pthread_mutex_lock(&g_lock);
+    int n = g_count < max_out ? g_count : max_out;
+    memcpy(out, g_channels, (size_t)n * sizeof(*out));
+    pthread_mutex_unlock(&g_lock);
+
+    qsort(out, (size_t)n, sizeof(*out), cmp_major_minor);
+    return n;
 }
 
 int dvb_channels_on_freq(uint32_t frequency_hz, const struct dvb_channel **out, int max_out)

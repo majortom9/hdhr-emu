@@ -473,6 +473,17 @@ void dvb_frontend_read_stats(int fd, struct dvb_signal_stats *out)
      * only really drops hard as you approach actual failure. */
     out->snr_quality_pct = convert_stat_pct(&stat_props[1], "cnr", 4.5, 33.0);
 
+    /* Raw values straight from the same batched read -- no extra ioctl
+     * (see the batching comment above for why that matters here). */
+    if (stat_props[0].u.st.len > 0 && stat_props[0].u.st.stat[0].scale == FE_SCALE_DECIBEL) {
+        out->have_signal_dbm = true;
+        out->signal_dbm = stat_props[0].u.st.stat[0].svalue / 1000.0;
+    }
+    if (stat_props[1].u.st.len > 0 && stat_props[1].u.st.stat[0].scale == FE_SCALE_DECIBEL) {
+        out->have_snr_db = true;
+        out->snr_db = stat_props[1].u.st.stat[0].svalue / 1000.0;
+    }
+
     /* DTV_STAT_ERROR_BLOCK_COUNT and DTV_STAT_TOTAL_BLOCK_COUNT are both
      * cumulative counters since the frontend was tuned (per the kernel
      * docs — "Block counts... measure the number of blocks and block

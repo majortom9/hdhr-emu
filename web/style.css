@@ -108,6 +108,16 @@ main {
   mix-blend-mode: difference;
 }
 
+/* Raw DVB dBm/dB reading under its bar, indented to line up with the
+ * bar itself (label width + .bar-row's gap), pulled up against it
+ * rather than spaced like a separate row. */
+.bar-raw {
+  margin: -0.3rem 0 0 10rem;
+  font-size: 0.75rem;
+  font-family: ui-monospace, monospace;
+  min-height: 0.9rem;
+}
+
 .rate { margin-top: 0.45rem; }
 
 /* chart-card is a flex column so .chart (no fixed height) grows to

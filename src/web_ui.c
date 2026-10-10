@@ -118,7 +118,7 @@ static void json_escape_append(char *out, size_t out_cap, size_t *off, const cha
  * or re-risked here. */
 static void append_tuner_json(char *buf, size_t cap, size_t *off, int idx)
 {
-    char name[32], status[512], vchannel[512], streaminfo[512], err[128];
+    char name[32], status[512], vchannel[512], streaminfo[512], debug[512], err[128];
 
     snprintf(name, sizeof(name), "/tuner%d/status", idx);
     if (!getset_client_call(name, NULL, status, sizeof(status), err, sizeof(err))) {
@@ -131,6 +131,12 @@ static void append_tuner_json(char *buf, size_t cap, size_t *off, int idx)
     snprintf(name, sizeof(name), "/tuner%d/streaminfo", idx);
     if (!getset_client_call(name, NULL, streaminfo, sizeof(streaminfo), err, sizeof(err))) {
         snprintf(streaminfo, sizeof(streaminfo), "none");
+    }
+    /* Raw dBm/dB readings only live in /tunerN/debug (see control.c's
+     * handle_tuner_get) -- /tunerN/status stays real-firmware-shaped. */
+    snprintf(name, sizeof(name), "/tuner%d/debug", idx);
+    if (!getset_client_call(name, NULL, debug, sizeof(debug), err, sizeof(err))) {
+        debug[0] = '\0';
     }
 
     char physical[64] = "none", lock[16] = "none";
@@ -150,8 +156,25 @@ static void append_tuner_json(char *buf, size_t cap, size_t *off, int idx)
     json_escape_append(buf, cap, off, lock);
     *off += (size_t)snprintf(buf + *off, cap - *off,
         "\",\"signal_strength_pct\":%d,\"signal_quality_pct\":%d,"
-        "\"symbol_quality_pct\":%d,\"bps\":%d,\"pps\":%d,\"streaminfo\":[",
+        "\"symbol_quality_pct\":%d,\"bps\":%d,\"pps\":%d,",
         ss, snq, seq, bps, pps);
+
+    /* JSON null when the driver didn't report that reading (token
+     * absent from /tunerN/debug), rather than a misleading 0. Re-emitted
+     * via %.1f from a parsed double so nothing unvalidated from the
+     * debug string lands in the JSON verbatim. */
+    char raw[32];
+    if (token_str(debug, "ss_dbm=", raw, sizeof(raw))) {
+        *off += (size_t)snprintf(buf + *off, cap - *off, "\"signal_dbm\":%.1f,", atof(raw));
+    } else {
+        *off += (size_t)snprintf(buf + *off, cap - *off, "\"signal_dbm\":null,");
+    }
+    if (token_str(debug, "snr_db=", raw, sizeof(raw))) {
+        *off += (size_t)snprintf(buf + *off, cap - *off, "\"snr_db\":%.1f,", atof(raw));
+    } else {
+        *off += (size_t)snprintf(buf + *off, cap - *off, "\"snr_db\":null,");
+    }
+    *off += (size_t)snprintf(buf + *off, cap - *off, "\"streaminfo\":[");
 
     /* streaminfo body: "tsid=0x....\n<program>: <major>.<minor> <name>\n..."
      * or a bare "none". Parse line by line, skipping the tsid= line

@@ -150,6 +150,60 @@ static void handle_m3u(int fd, const struct hdhr_config *cfg, int major, int min
     if (write(fd, body, (size_t)blen) < 0) { /* client already gone */ }
 }
 
+/* The whole lineup as one M3U playlist -- same idea as handle_m3u()
+ * above, for the web UI's lineup Export button (and any IPTV-style
+ * client that wants a plain playlist URL). tvg-chno/tvg-name are the
+ * de facto extended-M3U attributes Jellyfin/Kodi/Channels/VLC read for
+ * channel number and name; '"' in a PSIP short name is swapped for '\''
+ * inside the attribute so it can't terminate the quoted value early. */
+static void handle_lineup_m3u(int fd)
+{
+    char ip[16];
+    if (local_ip_for_peer(fd, ip, sizeof(ip)) != 0) snprintf(ip, sizeof(ip), "0.0.0.0");
+
+    size_t cap = 16384;
+    size_t off = 0;
+    char *body = malloc(cap);
+    if (!body) { send_headers(fd, "500 Internal Server Error", "text/plain", 0); return; }
+    off += (size_t)snprintf(body + off, cap - off, "#EXTM3U\n");
+
+    /* Sorted snapshot, major.minor ascending -- see dvb_channels_sorted(). */
+    struct dvb_channel *chs = malloc(DVB_CHANNEL_MAX * sizeof(*chs));
+    if (!chs) { free(body); send_headers(fd, "500 Internal Server Error", "text/plain", 0); return; }
+    int n = dvb_channels_sorted(chs, DVB_CHANNEL_MAX);
+    for (int i = 0; i < n; i++) {
+        const struct dvb_channel *ch = &chs[i];
+
+        /* one entry is well under 256 bytes (short_name is <16 chars) */
+        if (cap - off < 512) {
+            cap *= 2;
+            char *grown = realloc(body, cap);
+            if (!grown) { free(chs); free(body); send_headers(fd, "500 Internal Server Error", "text/plain", 0); return; }
+            body = grown;
+        }
+
+        char attr_name[sizeof(ch->short_name)];
+        snprintf(attr_name, sizeof(attr_name), "%s", ch->short_name);
+        for (char *p = attr_name; *p; p++) if (*p == '"') *p = '\'';
+
+        off += (size_t)snprintf(body + off, cap - off,
+            "#EXTINF:-1 tvg-chno=\"%d.%d\" tvg-name=\"%s\",%d.%d %s\n"
+            "http://%s:80/auto/v%d.%d\n",
+            ch->major, ch->minor, attr_name, ch->major, ch->minor, ch->short_name,
+            ip, ch->major, ch->minor);
+    }
+    free(chs);
+
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: audio/x-mpegurl\r\n"
+        "Content-Disposition: attachment; filename=\"lineup.m3u\"\r\n"
+        "Content-Length: %zu\r\nConnection: close\r\nServer: hdhr-emu\r\n\r\n", off);
+    if (write(fd, hdr, (size_t)hlen) < 0) { /* client already gone */ }
+    if (write(fd, body, off) < 0) { /* client already gone */ }
+    free(body);
+}
+
 static void handle_lineup_status_json(int fd)
 {
     send_json(fd,
@@ -173,10 +227,14 @@ static void handle_lineup_json(int fd, const struct hdhr_config *cfg)
     if (!body) { send_headers(fd, "500 Internal Server Error", "text/plain", 0); return; }
     off += (size_t)snprintf(body + off, cap - off, "[\n");
 
-    int n = dvb_channel_count();
+    /* Sorted snapshot, major.minor ascending -- see dvb_channels_sorted().
+     * Clients (Plex/Jellyfin/this daemon's own web UI) typically keep
+     * lineup.json's order as their channel list. */
+    struct dvb_channel *chs = malloc(DVB_CHANNEL_MAX * sizeof(*chs));
+    if (!chs) { free(body); send_headers(fd, "500 Internal Server Error", "text/plain", 0); return; }
+    int n = dvb_channels_sorted(chs, DVB_CHANNEL_MAX);
     for (int i = 0; i < n; i++) {
-        const struct dvb_channel *ch = dvb_channel_at(i);
-        if (!ch) continue;
+        const struct dvb_channel *ch = &chs[i];
 
         /* worst case a bit under 300 bytes for one entry (long name +
          * URL); keep plenty of headroom before formatting so snprintf
@@ -184,7 +242,7 @@ static void handle_lineup_json(int fd, const struct hdhr_config *cfg)
         if (cap - off < 512) {
             cap *= 2;
             char *grown = realloc(body, cap);
-            if (!grown) { free(body); send_headers(fd, "500 Internal Server Error", "text/plain", 0); return; }
+            if (!grown) { free(chs); free(body); send_headers(fd, "500 Internal Server Error", "text/plain", 0); return; }
             body = grown;
         }
 
@@ -195,6 +253,7 @@ static void handle_lineup_json(int fd, const struct hdhr_config *cfg)
             ip, ch->major, ch->minor,
             (i == n - 1) ? "" : ",");
     }
+    free(chs);
 
     if (cap - off < 8) {
         cap += 8;
@@ -357,6 +416,8 @@ static void handle_request(int fd, struct hdhr_config *cfg, struct hdhr_tuner *t
         handle_lineup_status_json(fd);
     } else if (strcmp(path, "/lineup.json") == 0) {
         handle_lineup_json(fd, cfg);
+    } else if (strcmp(path, "/lineup.m3u") == 0) {
+        handle_lineup_m3u(fd);
     } else if (strncmp(path, "/auto/v", 7) == 0) {
         size_t plen = strlen(path);
         int major = 0, minor = 0;

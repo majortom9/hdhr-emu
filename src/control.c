@@ -45,8 +45,10 @@
  *                      pools, PLL calibration, DMA/queue stats) this
  *                      daemon doesn't have; these report genuine
  *                      process/tuner state instead of fabricating
- *                      plausible-looking fake ones.
- *   /sys/restart       SET-only, "<resource>" argument (value accepted
+ *                      plausible-looking fake ones. /tunerN/debug also
+ *                      carries the raw DVB dBm/dB readings (ss_dbm=,
+ *                      snr_db=) behind status's ss=/snq= percentages.
+ *   /sys/restart      SET-only, "<resource>" argument (value accepted
  *                      but not distinguished — this daemon is one
  *                      process either way). Rejected unless
  *                      allow_remote_restart=1 in the config (default
@@ -578,8 +580,31 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
          * omitting them. Report the state we actually have instead:
          * the same summary /tunerN/status already tracks, plus fields
          * status doesn't surface (busy/program/target). */
-        snprintf(val, sizeof(val), "%s program=%d target=%s busy=%d",
-                 t->status, t->program, t->target, t->busy ? 1 : 0);
+        int off = snprintf(val, sizeof(val), "%s program=%d target=%s busy=%d",
+                           t->status, t->program, t->target, t->busy ? 1 : 0);
+        /* Raw DVB readings (dBm/dB, see dvb_signal_stats' have_signal_dbm
+         * comment) behind the status line's ss=/snq= percentages, for
+         * the web UI -- deliberately here, not in /tunerN/status, which
+         * stays byte-compatible with real firmware. Each token is simply
+         * omitted when that reading isn't available. Same source
+         * precedence as the status branch above: active stream, then
+         * held tune, then live scan progress for the current frequency. */
+        struct dvb_signal_stats raw;
+        bool have_raw = false;
+        if (t->active_stream && dvb_stream_get_cached_stats(t->active_stream, &raw)) {
+            have_raw = true;
+        } else if (t->held_fd >= 0) {
+            if (t->held_stats_cache_valid) { raw = t->held_stats_cache; have_raw = true; }
+        } else if (t->scan_stats_valid && t->scan_stats_freq == t->tuned_frequency_hz) {
+            raw = t->scan_stats;
+            have_raw = true;
+        }
+        if (have_raw && raw.have_signal_dbm && off > 0 && (size_t)off < sizeof(val)) {
+            off += snprintf(val + off, sizeof(val) - (size_t)off, " ss_dbm=%.1f", raw.signal_dbm);
+        }
+        if (have_raw && raw.have_snr_db && off > 0 && (size_t)off < sizeof(val)) {
+            snprintf(val + off, sizeof(val) - (size_t)off, " snr_db=%.1f", raw.snr_db);
+        }
     } else {
         tuner_unlock(t);
         send_error_reply(fd, name, "ERROR: parameter is write-only or unknown");

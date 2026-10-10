@@ -16,7 +16,7 @@
   <section id="tuners"></section>
 
   <section id="lineup-section">
-    <h2>Lineup <button id="lineup-refresh" class="small">Refresh</button></h2>
+    <h2>Lineup <button id="lineup-refresh" class="small">Refresh</button> <button id="lineup-export" class="small">Export M3U</button></h2>
     <div id="lineup"></div>
   </section>
 </main>
@@ -35,10 +35,12 @@
           <label>Signal Strength</label>
           <div class="bar"><div class="bar-fill ss"></div><span class="bar-pct ss-pct"></span></div>
         </div>
+        <div class="bar-raw ss-raw muted"></div>
         <div class="bar-row">
           <label>Signal Quality</label>
           <div class="bar"><div class="bar-fill snq"></div><span class="bar-pct snq-pct"></span></div>
         </div>
+        <div class="bar-raw snq-raw muted"></div>
         <div class="bar-row">
           <label>Symbol Quality</label>
           <div class="bar"><div class="bar-fill seq"></div><span class="bar-pct seq-pct"></span></div>

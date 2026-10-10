@@ -303,7 +303,9 @@ build step, no framework) talking to a small JSON API
 [ARCHITECTURE.md §18](ARCHITECTURE.md) for why.
 
 Per tuner, it shows live status (locked channel, signal-strength/
-quality/symbol-quality bars, network rate, virtual channels found on
+quality/symbol-quality bars, with the raw DVB-API signal strength
+(dBm) and SNR (dB) the strength/quality percentages are scaled from
+shown under their bars, network rate, virtual channels found on
 the current mux), and lets you:
 - **Set** a channel manually (channel number, e.g. `24`)
 - **Release** a tuner back to `none` so it's not left parked/held when
@@ -328,6 +330,17 @@ ends, so it just shows as an endless download with no way to stop it):
 - **mpv** — same idea, Android only (no comparably standardized mpv
   port/protocol-handler on iOS or desktop)
 
+**Export M3U** (next to Refresh) downloads the whole lineup as one
+playlist (`/lineup.m3u`, with `tvg-chno`/`tvg-name` attributes), for
+importing into an IPTV player or anything else that takes a playlist
+URL.
+
+The raw dBm/dB values come from `/tunerN/debug`'s `ss_dbm=`/`snr_db=`
+tokens rather than `/tunerN/status`, which stays byte-compatible with
+real firmware. A token is left out when the driver doesn't report that
+stat in decibels; CNR in particular is often unavailable until the
+tuner locks.
+
 ## Generating a stable device ID
 
 ```sh
@@ -349,7 +362,7 @@ src/
   discovery.*       UDP 65001 — DISCOVER_REQ/RPY
   control.*        TCP 65001 — GETSET_REQ/RPY dispatch (see its own
                      header comment for the full endpoint list)
-  http_server.*     discover.json / lineup.json / lineup_status.json /
+  http_server.*     discover.json / lineup.json / lineup.m3u / lineup_status.json /
                      auto/vX.X (TCP 80)
   getset_client.*    loopback GETSET client -- talks to this daemon's
                       own control port exactly like hdhomerun_config

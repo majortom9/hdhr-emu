@@ -32,6 +32,17 @@ struct dvb_signal_stats {
     int signal_strength_pct; /* ss  */
     int snr_quality_pct;     /* snq — derived from CNR (dB) */
     int symbol_quality_pct;  /* seq — derived from post-Viterbi error block rate */
+    /* The raw DVBv5 readings signal_strength_pct/snr_quality_pct are
+     * scaled from, in their native units, before any floor/ceiling
+     * mapping -- only valid when the driver reports that stat on the
+     * FE_SCALE_DECIBEL scale (the have_ flag is false otherwise, e.g.
+     * CNR on most demods before lock). Surfaced via /tunerN/debug for
+     * the web UI, not via /tunerN/status, which stays byte-compatible
+     * with real firmware (no raw-unit fields there). */
+    bool   have_signal_dbm;
+    double signal_dbm;       /* DTV_STAT_SIGNAL_STRENGTH, dBm */
+    bool   have_snr_db;
+    double snr_db;           /* DTV_STAT_CNR, dB */
 };
 
 /* Opens /dev/dvb/adapter<adapter>/frontend<frontend>. Returns fd, or -1
