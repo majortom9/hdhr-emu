@@ -407,6 +407,12 @@ struct hdhr_tuner {
     volatile int udp_push_active;
     volatile int udp_push_stop_requested;
     pthread_t    udp_push_thread;
+    /* Bumped by every udp_push_start(); the push thread clears
+     * udp_push_active on exit only if this still matches the value it
+     * was started with -- udp_push_stop() stops waiting after ~2s, so a
+     * slow-to-exit old thread can finish *after* a newer push started,
+     * and must not clear that newer push's flag. Guarded by `lock`. */
+    uint32_t     udp_push_generation;
 
     /* Destination of the current target= UDP push, in binary form, set
      * by udp_push_start() before the push thread starts (valid only

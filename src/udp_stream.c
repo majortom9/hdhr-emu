@@ -80,6 +80,7 @@ struct push_ctx {
     char pid_filter[256]; /* snapshot of t->filter_override at push-start time; see tuner.h */
     char dest_ip[64];
     int  dest_port;
+    uint32_t generation; /* t->udp_push_generation at start -- see tuner.h */
 };
 
 static void *push_thread_main(void *arg)
@@ -181,6 +182,18 @@ static void *push_thread_main(void *arg)
 
     tuner_release(t); /* closes ds internally */
 done_no_claim:
+    /* Every exit path -- including never getting the tuner at all --
+     * must clear udp_push_active, or this push looks alive forever: an
+     * earlier version never cleared it, so after any push had run, every
+     * later udp_push_stop() (called by each vchannel/channel/channelmap/
+     * target SET) spun its full ~2s timeout waiting for a thread that had
+     * long since exited -- most of a real client's 2.5s reply patience --
+     * and keepalive.c's sweep kept "reclaiming" it. Cleared after
+     * tuner_release(), so a udp_push_stop() caller that sees 0 knows the
+     * tuner claim is already released too. */
+    tuner_lock(t);
+    if (t->udp_push_generation == ctx->generation) t->udp_push_active = 0;
+    tuner_unlock(t);
     free(ctx);
     return NULL;
 }
@@ -341,6 +354,7 @@ int udp_push_start(const struct hdhr_config *cfg, struct hdhr_tuner *t,
 
     t->udp_push_stop_requested = 0;
     t->udp_push_active = 1;
+    ctx->generation = ++t->udp_push_generation;
     int rc = pthread_create(&t->udp_push_thread, NULL, push_thread_main, ctx);
     if (rc != 0) {
         t->udp_push_active = 0;
