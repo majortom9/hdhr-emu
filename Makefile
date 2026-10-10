@@ -4,7 +4,16 @@ LDLIBS  := -lpthread -lm
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
+DEP := $(OBJ:.o=.d)
 BIN := hdhr-emu
+
+# Header dependency tracking (-MMD -MP writes a .d per object, -include'd
+# below) -- without it, changing a struct in a header (e.g. growing
+# struct dvb_signal_stats, which struct hdhr_tuner embeds) only rebuilt
+# the .c files that were themselves touched, leaving the rest compiled
+# against the old layout: a silent ABI mismatch that corrupted tuner
+# state at runtime.
+DEPFLAGS := -MMD -MP
 
 .PHONY: all clean install test
 
@@ -14,7 +23,9 @@ $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDLIBS)
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+-include $(DEP)
 
 # PAT/PMT/TVCT parser round-trip self-test — no hardware needed, pure
 # data-structure encode/decode. See test/psip_test.c for what this does
@@ -31,7 +42,7 @@ calibrate: src/dvb_frontend.c src/dvb_frontend.h src/atsc_freq.c src/atsc_freq.h
 	$(CC) $(CFLAGS) -o calibrate src/dvb_frontend.c src/atsc_freq.c tools/calibrate_stats.c $(LDLIBS)
 
 clean:
-	rm -f $(OBJ) $(BIN) calibrate
+	rm -f $(OBJ) $(DEP) $(BIN) calibrate
 
 # Installs the binary + a systemd unit. Run as root on the target Pi.
 install: $(BIN)
