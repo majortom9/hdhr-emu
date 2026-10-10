@@ -334,7 +334,39 @@ struct dvb_stream *dvb_stream_open(int adapter, int frontend, int demux_num,
     }
     /* Returns on its first status read if already locked (the common
      * adopted case), so this costs nothing there. */
-    if (!dvb_frontend_wait_lock(s->frontend_fd, LOCK_TIMEOUT_MS, NULL, NULL)) {
+    struct timespec lock_t0, lock_t1;
+    clock_gettime(CLOCK_MONOTONIC, &lock_t0);
+    bool locked = dvb_frontend_wait_lock(s->frontend_fd, LOCK_TIMEOUT_MS, NULL, NULL);
+    bool retried = false;
+    if (!locked) {
+        /* One more attempt on a freshly reopened frontend. Measured live
+         * (2026-10-10, cold opens with a temporary 6s timeout): a lock
+         * either lands in ~650-710ms or not at all -- nothing arrived
+         * between 0.7s and 6s -- so waiting longer doesn't help, but an
+         * occasional cold open of a strong channel (2.1: -45dBm, 22dB
+         * SNR) still failed: dmesg showed lgdt3306a's search loop=0..4
+         * all missing right after lgdt3306a_init. Re-issuing the tune on
+         * the same fd does nothing -- the driver logs "already set,
+         * skipping" for identical parameters and just reruns the failed
+         * search -- so the retry closes and reopens the frontend for a
+         * genuine re-init. A channel with no signal at all (e.g. a stale
+         * cache entry) just takes ~2x LOCK_TIMEOUT_MS to 502. */
+        retried = true;
+        dvb_frontend_close(s->frontend_fd);
+        s->frontend_fd = dvb_frontend_open(adapter, frontend);
+        if (s->frontend_fd < 0) { free(s); return NULL; }
+        int rc = qam ? dvb_frontend_tune_qam(s->frontend_fd, channel->frequency_hz)
+                     : dvb_frontend_tune_8vsb(s->frontend_fd, channel->frequency_hz);
+        locked = (rc == 0) && dvb_frontend_wait_lock(s->frontend_fd, LOCK_TIMEOUT_MS, NULL, NULL);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &lock_t1);
+    /* One line per stream open -- low volume, and the lock timing is the
+     * first thing worth knowing when a client reports a slow start. */
+    fprintf(stderr, "dvb_stream: %d.%d (%s frontend) lock=%d after %ldms%s\n",
+            channel->major, channel->minor, adopted ? "adopted" : "fresh", locked,
+            (lock_t1.tv_sec - lock_t0.tv_sec) * 1000L + (lock_t1.tv_nsec - lock_t0.tv_nsec) / 1000000L,
+            retried ? " (frontend reopened once)" : "");
+    if (!locked) {
         fprintf(stderr, "dvb_stream: no lock on %u Hz for %d.%d%s\n",
                 channel->frequency_hz, channel->major, channel->minor,
                 adopted ? " (adopted frontend fd)" : "");
